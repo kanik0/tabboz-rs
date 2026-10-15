@@ -14,5 +14,8 @@ name = "tabboz"
 path = "src/main.rs"
 
 [dependencies]
+raw-window-handle = "0.6"
+softbuffer = "0.4.8"
 tabboz-core = { path = "../tabboz-core" }
 tabboz-win = { path = "../tabboz-win" }
+winit = "0.30.13"

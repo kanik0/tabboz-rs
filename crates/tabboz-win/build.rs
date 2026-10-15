@@ -590,6 +590,408 @@ fn gen_assets(resources: &Path, out: &mut String) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Minimal JSON parser (only what the exported resources need)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // the grammar is wider than what the resources use
+enum Json {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+    fn as_str(&self) -> &str {
+        match self {
+            Json::Str(s) => s,
+            other => panic!("expected JSON string, got {other:?}"),
+        }
+    }
+    fn as_f64(&self) -> f64 {
+        match self {
+            Json::Num(n) => *n,
+            other => panic!("expected JSON number, got {other:?}"),
+        }
+    }
+    fn as_arr(&self) -> &[Json] {
+        match self {
+            Json::Arr(v) => v,
+            other => panic!("expected JSON array, got {other:?}"),
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { bytes: s.as_bytes(), pos: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> u8 {
+        self.bytes[self.pos]
+    }
+
+    fn expect(&mut self, c: u8) {
+        self.skip_ws();
+        assert_eq!(self.peek(), c, "JSON: expected '{}' at byte {}", c as char, self.pos);
+        self.pos += 1;
+    }
+
+    fn parse_value(&mut self) -> Json {
+        self.skip_ws();
+        match self.peek() {
+            b'{' => {
+                self.pos += 1;
+                let mut pairs = Vec::new();
+                self.skip_ws();
+                if self.peek() == b'}' {
+                    self.pos += 1;
+                    return Json::Obj(pairs);
+                }
+                loop {
+                    self.skip_ws();
+                    let key = match self.parse_value() {
+                        Json::Str(s) => s,
+                        other => panic!("JSON: object key must be a string, got {other:?}"),
+                    };
+                    self.expect(b':');
+                    let val = self.parse_value();
+                    pairs.push((key, val));
+                    self.skip_ws();
+                    match self.peek() {
+                        b',' => self.pos += 1,
+                        b'}' => {
+                            self.pos += 1;
+                            return Json::Obj(pairs);
+                        }
+                        c => panic!("JSON: expected ',' or '}}', got '{}' at byte {}", c as char, self.pos),
+                    }
+                }
+            }
+            b'[' => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                self.skip_ws();
+                if self.peek() == b']' {
+                    self.pos += 1;
+                    return Json::Arr(items);
+                }
+                loop {
+                    items.push(self.parse_value());
+                    self.skip_ws();
+                    match self.peek() {
+                        b',' => self.pos += 1,
+                        b']' => {
+                            self.pos += 1;
+                            return Json::Arr(items);
+                        }
+                        c => panic!("JSON: expected ',' or ']', got '{}' at byte {}", c as char, self.pos),
+                    }
+                }
+            }
+            b'"' => Json::Str(self.parse_string()),
+            b't' => {
+                self.expect_word("true");
+                Json::Bool(true)
+            }
+            b'f' => {
+                self.expect_word("false");
+                Json::Bool(false)
+            }
+            b'n' => {
+                self.expect_word("null");
+                Json::Null
+            }
+            _ => {
+                let start = self.pos;
+                while self.pos < self.bytes.len()
+                    && matches!(self.bytes[self.pos], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    self.pos += 1;
+                }
+                let raw = std::str::from_utf8(&self.bytes[start..self.pos]).expect("utf8 in number");
+                Json::Num(raw.parse().unwrap_or_else(|_| panic!("JSON: bad number '{raw}'")))
+            }
+        }
+    }
+
+    fn expect_word(&mut self, word: &str) {
+        for c in word.bytes() {
+            assert_eq!(self.bytes[self.pos], c, "JSON: expected '{word}'");
+            self.pos += 1;
+        }
+    }
+
+    fn parse_string(&mut self) -> String {
+        assert_eq!(self.peek(), b'"');
+        self.pos += 1;
+        let mut out = String::new();
+        loop {
+            let c = self.bytes[self.pos];
+            self.pos += 1;
+            match c {
+                b'"' => return out,
+                b'\\' => {
+                    let e = self.bytes[self.pos];
+                    self.pos += 1;
+                    match e {
+                        b'n' => out.push('\n'),
+                        b't' => out.push('\t'),
+                        b'r' => out.push('\r'),
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'u' => {
+                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4]).expect("utf8 hex");
+                            self.pos += 4;
+                            let cp = u32::from_str_radix(hex, 16).expect("bad \\u escape");
+                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                        }
+                        other => panic!("JSON: unsupported escape '\\{}'", other as char),
+                    }
+                }
+                _ => {
+                    // Collect a full UTF-8 sequence.
+                    let start = self.pos - 1;
+                    let len = utf8_len(c);
+                    self.pos = start + len;
+                    out.push_str(std::str::from_utf8(&self.bytes[start..self.pos]).expect("utf8"));
+                }
+            }
+        }
+    }
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else {
+        4
+    }
+}
+
+fn parse_json(s: &str) -> Json {
+    let mut p = JsonParser::new(s);
+    let v = p.parse_value();
+    p.skip_ws();
+    assert_eq!(p.pos, p.bytes.len(), "JSON: trailing garbage");
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Code generation: menus.rs and strings.rs
+// ---------------------------------------------------------------------------
+
+fn gen_menus(menus_path: &Path, out: &mut String) -> usize {
+    let json = fs::read_to_string(menus_path).expect("read menus json");
+    let root = parse_json(&json);
+    let popups = root.as_arr();
+    macro_rules! w {
+        ($s:expr) => {
+            writeln!(out, "{}", $s).unwrap()
+        };
+    }
+    w!("// @generated by tabboz-win/build.rs from resources/menus/ -- do not edit.");
+    w!("");
+    w!("/// One entry of a popup menu.");
+    w!("#[derive(Clone, Copy, Debug)]");
+    w!("pub struct MenuItem {");
+    w!("    /// '&' marks the keyboard hotkey.");
+    w!("    pub label: &'static str,");
+    w!("    /// Command id sent to the dialog handler (0 for separators).");
+    w!("    pub menu_id: u16,");
+    w!("    pub separator: bool,");
+    w!("}");
+    w!("");
+    w!("/// One top-level popup of the menu bar.");
+    w!("#[derive(Clone, Copy, Debug)]");
+    w!("pub struct MenuPopup {");
+    w!("    pub label: &'static str,");
+    w!("    pub items: &'static [MenuItem],");
+    w!("}");
+    w!("");
+    let mut total = 0;
+    for (i, popup) in popups.iter().enumerate() {
+        let label = popup.get("label").expect("popup label").as_str();
+        let items = popup.get("items").expect("popup items").as_arr();
+        w!(format!("static MENU_ITEMS_{}: &[MenuItem] = &[", i));
+        for item in items {
+            let kind = item.get("kind").expect("item kind").as_str();
+            match kind {
+                "menuitem" => {
+                    let label = item.get("label").expect("item label").as_str();
+                    let id = item.get("menu_id").expect("item menu_id").as_f64() as u16;
+                    w!(format!(
+                        "    MenuItem {{ label: {}, menu_id: {}, separator: false }},",
+                        rust_lit(&unescape_menu(label)),
+                        id
+                    ));
+                }
+                "separator" => {
+                    w!("    MenuItem { label: \"\", menu_id: 0, separator: true },");
+                }
+                other => panic!("unknown menu item kind '{other}'"),
+            }
+            total += 1;
+        }
+        w!("];");
+        w!(format!("static MENU_POPUP_{}: MenuPopup = MenuPopup {{ label: {}, items: MENU_ITEMS_{} }};", i, rust_lit(&unescape_menu(label)), i));
+        w!("");
+    }
+    w!("/// Menu bar of the main window (resource \"zarrosim\").");
+    w!("pub static MENUBAR: &[MenuPopup] = &[");
+    for i in 0..popups.len() {
+        w!(format!("    MENU_POPUP_{i},"));
+    }
+    w!("];");
+    total
+}
+
+/// JSON menus store '&' hotkeys as-is; nothing to unescape today, kept for symmetry.
+fn unescape_menu(s: &str) -> String {
+    s.to_string()
+}
+
+fn gen_strings(strings_dir: &Path, out: &mut String) -> usize {
+    let mut entries: Vec<(u16, String)> = Vec::new();
+    for file in sorted_files(strings_dir, "json") {
+        let json = fs::read_to_string(strings_dir.join(&file)).expect("read string table");
+        let root = parse_json(&json);
+        let Json::Obj(pairs) = root else { panic!("{file}: expected a JSON object") };
+        for (key, value) in pairs {
+            let id: u16 = key.parse().unwrap_or_else(|_| panic!("{file}: bad string id '{key}'"));
+            entries.push((id, value.as_str().to_string()));
+        }
+    }
+    entries.sort_by_key(|(id, _)| *id);
+
+    macro_rules! w {
+        ($s:expr) => {
+            writeln!(out, "{}", $s).unwrap()
+        };
+    }
+    w!("// @generated by tabboz-win/build.rs from resources/strings/ -- do not edit.");
+    w!("");
+    w!("/// One entry of the original STRINGTABLE resources.");
+    w!("#[derive(Clone, Copy, Debug)]");
+    w!("pub struct StringEntry {");
+    w!("    pub id: u16,");
+    w!("    pub text: &'static str,");
+    w!("}");
+    w!("");
+    w!("/// All string table entries, sorted by id.");
+    w!("pub static STRINGS: &[StringEntry] = &[");
+    for (id, text) in &entries {
+        w!(format!("    StringEntry {{ id: {}, text: {} }},", id, rust_lit(text)));
+    }
+    w!("];");
+    w!("");
+    w!("/// Looks up a string table entry by id.");
+    w!("pub fn find(id: u16) -> Option<&'static str> {");
+    w!("    STRINGS.iter().find(|s| s.id == id).map(|s| s.text)");
+    w!("}");
+    entries.len()
+}
+
+fn sorted_files(dir: &Path, ext: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(ext))
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .collect();
+    names.sort_by_key(|n| (n.parse::<u32>().unwrap_or(u32::MAX), n.clone()));
+    names
+}
+
+// ---------------------------------------------------------------------------
+// WOFF -> TTF conversion (so ab_glyph can load the bundled MS Sans Serif)
+// ---------------------------------------------------------------------------
+
+fn woff_to_ttf(woff: &[u8]) -> Vec<u8> {
+    assert_eq!(&woff[0..4], b"wOFF", "not a WOFF font");
+    let read_u32 = |off: usize| -> u32 {
+        u32::from_be_bytes([woff[off], woff[off + 1], woff[off + 2], woff[off + 3]])
+    };
+    let read_u16 = |off: usize| -> u16 { u16::from_be_bytes([woff[off], woff[off + 1]]) };
+
+    let flavor = read_u32(4);
+    let num_tables = read_u16(12) as usize;
+
+    // Decompress every table (WOFF keeps the sfnt directory order).
+    let mut tables: Vec<(u32, Vec<u8>)> = Vec::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let rec = 44 + 20 * i;
+        let tag = read_u32(rec);
+        let offset = read_u32(rec + 4) as usize;
+        let comp_len = read_u32(rec + 8) as usize;
+        let orig_len = read_u32(rec + 12) as usize;
+        let data = if comp_len == orig_len {
+            woff[offset..offset + orig_len].to_vec()
+        } else {
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&woff[offset..offset + comp_len], orig_len)
+                .unwrap_or_else(|e| panic!("WOFF: zlib table decompression failed: {e:?}"))
+        };
+        assert_eq!(data.len(), orig_len, "WOFF: decompressed table size mismatch");
+        tables.push((tag, data));
+    }
+
+    // sfnt layout: 12-byte header + 16*n directory + tables padded to 4 bytes.
+    let mut offsets = Vec::with_capacity(num_tables);
+    let mut cursor = 12 + 16 * num_tables;
+    for (_, data) in &tables {
+        offsets.push(cursor as u32);
+        cursor += data.len().div_ceil(4) * 4;
+    }
+
+    let mut out = Vec::with_capacity(cursor);
+    out.extend_from_slice(&flavor.to_be_bytes());
+    out.extend_from_slice(&(num_tables as u16).to_be_bytes());
+    let pow = 1usize << (usize::BITS - 1 - num_tables.leading_zeros()); // greatest power of two <= num_tables
+    out.extend_from_slice(&((pow * 16) as u16).to_be_bytes()); // searchRange
+    out.extend_from_slice(&(pow.trailing_zeros() as u16).to_be_bytes()); // entrySelector
+    out.extend_from_slice(&(((num_tables - pow) * 16) as u16).to_be_bytes()); // rangeShift
+    for (i, (tag, data)) in tables.iter().enumerate() {
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // checkSum: parsers we use do not verify it
+        out.extend_from_slice(&offsets[i].to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    }
+    for (_, data) in &tables {
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -628,10 +1030,61 @@ fn main() {
     let asset_count = gen_assets(&resources, &mut assets_code);
     fs::write(out_dir.join("assets.rs"), assets_code).expect("write assets.rs");
 
+    // Menu bar (resources/menus) and string tables (resources/strings).
+    let mut menus_code = String::new();
+    let menu_items = gen_menus(&resources.join("menus/ZARROSIM.json"), &mut menus_code);
+    fs::write(out_dir.join("menus.rs"), menus_code).expect("write menus.rs");
+
+    let mut strings_code = String::new();
+    let string_count = gen_strings(&resources.join("strings"), &mut strings_code);
+    fs::write(out_dir.join("strings.rs"), strings_code).expect("write strings.rs");
+
+    // Fonts: the MS Sans Serif webfonts bundled with the web port are WOFF
+    // (zlib-wrapped sfnt); convert them to plain TTF so ab_glyph can load them.
+    let mut fonts_code = String::new();
+    let regular = woff_to_ttf(&fs::read(resources.join("css/ms_sans_serif.woff")).expect("read ms_sans_serif.woff"));
+    let bold = woff_to_ttf(&fs::read(resources.join("css/ms_sans_serif_bold.woff")).expect("read ms_sans_serif_bold.woff"));
+    writeln!(
+        fonts_code,
+        "// @generated by tabboz-win/build.rs from resources/css/ms_sans_serif*.woff -- do not edit.\n\
+         /// MS Sans Serif regular, converted from the WOFF bundled with the web port.\n\
+         pub static FONT_REGULAR: &[u8] = {ttf};\n\
+         /// MS Sans Serif bold.\n\
+         pub static FONT_BOLD: &[u8] = {ttfb};",
+        ttf = {
+            let mut lit = String::from("&[");
+            for (i, b) in regular.iter().enumerate() {
+                if i % 20 == 0 {
+                    lit.push_str("\n    ");
+                }
+                write!(lit, "{b},").unwrap();
+            }
+            lit.push_str("\n]");
+            lit
+        },
+        ttfb = {
+            let mut lit = String::from("&[");
+            for (i, b) in bold.iter().enumerate() {
+                if i % 20 == 0 {
+                    lit.push_str("\n    ");
+                }
+                write!(lit, "{b},").unwrap();
+            }
+            lit.push_str("\n]");
+            lit
+        },
+    )
+    .expect("write fonts.rs");
+    fs::write(out_dir.join("fonts.rs"), fonts_code).expect("write fonts.rs");
+
     println!(
-        "cargo:warning=tabboz-win codegen: {} dialogs, {} controls, {} embedded assets",
+        "cargo:warning=tabboz-win codegen: {} dialogs, {} controls, {} embedded assets, {} menu items, {} strings, fonts {}+{} bytes",
         dialogs.len(),
         dialogs.iter().map(|d| d.controls.len()).sum::<usize>(),
-        asset_count
+        asset_count,
+        menu_items,
+        string_count,
+        regular.len(),
+        bold.len()
     );
 }
