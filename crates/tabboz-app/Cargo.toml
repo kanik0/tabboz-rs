@@ -1,0 +1,18 @@
+# Tabboz Simulator - Rust port
+
+# Tabboz Simulator 1997-2000 Andrea Bonomi; this port is GPL-3.0-or-later.
+
+[package]
+name = "tabboz-app"
+description = "Tabboz Simulator: macOS application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tabboz"
+path = "src/main.rs"
+
+[dependencies]
+tabboz-core = { path = "../tabboz-core" }
+tabboz-win = { path = "../tabboz-win" }

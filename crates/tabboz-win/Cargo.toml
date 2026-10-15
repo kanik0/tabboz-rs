@@ -1,0 +1,14 @@
+# Tabboz Simulator - Rust port
+
+# Tabboz Simulator 1997-2000 Andrea Bonomi; this port is GPL-3.0-or-later.
+
+[package]
+name = "tabboz-win"
+description = "Tabboz Simulator: Win32/BWCC dialog engine (code-generated from .rc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[build-dependencies]
