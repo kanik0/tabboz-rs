@@ -110,7 +110,7 @@ impl ApplicationHandler for App {
                 self.frame.mouse_leave();
                 self.redraw();
             }
-            WindowEvent::MouseInput { state, button, .. } if button == winit::event::MouseButton::Left => {
+            WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
                 let (x, y) = (self.mouse.0 / scale, self.mouse.1 / scale);
                 match state {
                     winit::event::ElementState::Pressed => {

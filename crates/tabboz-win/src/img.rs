@@ -68,7 +68,7 @@ pub fn decode_bmp(d: &[u8]) -> Result<Image, String> {
 
     match bpp {
         1 | 4 | 8 if compression == 0 => {
-            let row_bytes = ((w as usize * bpp + 31) / 32) * 4;
+            let row_bytes = (w as usize * bpp).div_ceil(32) * 4;
             for y in 0..h {
                 let row = data_offset + y as usize * row_bytes;
                 for x in 0..w {
@@ -200,8 +200,8 @@ pub fn decode_ico(d: &[u8]) -> Result<Image, String> {
     }
 
     let xor_off = off + dib + if bpp <= 8 { (1 << bpp) * 4 } else { 0 };
-    let row_bytes = ((w as usize * bpp + 31) / 32) * 4;
-    let and_row_bytes = ((w as usize + 31) / 32) * 4;
+    let row_bytes = (w as usize * bpp).div_ceil(32) * 4;
+    let and_row_bytes = (w as usize).div_ceil(32) * 4;
     let and_off = xor_off + row_bytes * xor_h as usize;
 
     let mut data = vec![0u32; (w * h) as usize];

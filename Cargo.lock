@@ -1373,6 +1373,13 @@ dependencies = [
 [[package]]
 name = "tabboz-core"
 version = "0.1.0"
+dependencies = [
+ "tabboz-res",
+]
+
+[[package]]
+name = "tabboz-res"
+version = "0.1.0"
 
 [[package]]
 name = "tabboz-win"
@@ -1380,6 +1387,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "miniz_oxide",
+ "tabboz-res",
 ]
 
 [[package]]

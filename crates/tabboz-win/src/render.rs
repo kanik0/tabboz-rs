@@ -283,8 +283,7 @@ impl Frame {
     }
 
     pub fn mouse_leave(&mut self) -> bool {
-        let had = self.state.hover_menu_item.take().is_some();
-        had
+        self.state.hover_menu_item.take().is_some()
     }
 
     pub fn mouse_down(&mut self, x: i32, y: i32, fonts: &mut Fonts) -> bool {

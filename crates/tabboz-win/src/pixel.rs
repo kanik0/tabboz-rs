@@ -64,7 +64,7 @@ impl<'a> Surface<'a> {
             return;
         }
         let i = (y * self.w + x) as usize;
-        if a >= 255 {
+        if a == 255 {
             self.buf[i] = color;
             return;
         }

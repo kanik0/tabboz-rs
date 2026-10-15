@@ -1,0 +1,12 @@
+# Tabboz Simulator - Rust port
+
+# Tabboz Simulator 1997-2000 Andrea Bonomi; this port is GPL-3.0-or-later.
+
+[package]
+name = "tabboz-res"
+description = "Tabboz Simulator: code-generated game resource data (string tables, menus)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

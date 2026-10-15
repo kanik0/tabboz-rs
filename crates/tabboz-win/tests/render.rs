@@ -24,7 +24,7 @@ fn render_main() -> (Vec<u32>, i32, i32, Frame, Fonts) {
 #[test]
 fn main_window_size_matches_the_original() {
     // 204x185 dialog units * 2 px + 4 px frame + 18 title + 20 menu.
-    let mut frame = Frame::new(1);
+    let frame = Frame::new(1);
     assert_eq!(frame.window_size(), (412, 412));
 }
 
