@@ -5,7 +5,7 @@
 // One Frame instance drives one window; the app (tabboz-app) owns the
 // winit window and softbuffer surface and feeds events in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dialogs::{self, Control, ControlKind, Dialog};
 use crate::font::Fonts;
@@ -128,6 +128,12 @@ struct FrameState {
     cache: HashMap<String, Image>,
     /// Composed tabboz (recomputed when the view changes).
     composed: Option<Image>,
+    /// SetDlgItemText overrides (control id -> text).
+    text: HashMap<i32, String>,
+    /// BM_SETCHECK state (radio/checkbox control ids).
+    checked: HashSet<i32>,
+    /// Render offset of this frame inside the window (modal dialogs).
+    offset: (i32, i32),
 }
 
 impl Frame {
@@ -139,11 +145,69 @@ impl Frame {
         }
     }
 
+    /// Builds a frame from a runtime dialog template (message boxes).
+    pub fn from_dialog(dlg: &'static Dialog) -> Self {
+        Frame {
+            dlg,
+            tabboz: TabbozView::default(),
+            state: FrameState::default(),
+        }
+    }
+
+    /// SetDlgItemText: overrides the text of a control at runtime.
+    pub fn set_text(&mut self, id: i32, s: impl Into<String>) {
+        self.state.text.insert(id, s.into());
+    }
+
+    /// Effective text of a control (override or template).
+    pub fn text(&self, c: &Control) -> &str {
+        self.state
+            .text
+            .get(&c.id)
+            .map(|s| s.as_str())
+            .unwrap_or(c.text)
+    }
+
+    /// BM_SETCHECK.
+    pub fn check(&mut self, id: i32, on: bool) {
+        if on {
+            self.state.checked.insert(id);
+        } else {
+            self.state.checked.remove(&id);
+        }
+    }
+
+    /// Radio semantics: all the radios of a dialog form one group (exactly
+    /// what the original dialogs do), so checking one clears the others.
+    pub fn check_radio(&mut self, id: i32) {
+        let radios: Vec<i32> = self
+            .dlg
+            .controls
+            .iter()
+            .filter(|c| c.kind == ControlKind::BorRadio)
+            .map(|c| c.id)
+            .collect();
+        for r in radios {
+            self.state.checked.remove(&r);
+        }
+        self.state.checked.insert(id);
+    }
+
+    /// Position of this frame inside the window surface (modal dialogs).
+    pub fn set_offset(&mut self, x: i32, y: i32) {
+        self.state.offset = (x, y);
+    }
+
+    pub fn dialog_id(&self) -> u32 {
+        self.dlg.id
+    }
+
     /// Total window size in logical pixels, chrome included.
     pub fn window_size(&self) -> (i32, i32) {
+        let menu = if self.dlg.menu.is_some() { MENU_H } else { 0 };
         (
             self.dlg.w * DLU + 2 * BORDER,
-            self.dlg.h * DLU + 2 * BORDER + TITLE_H + MENU_H,
+            self.dlg.h * DLU + 2 * BORDER + TITLE_H + menu,
         )
     }
 
@@ -161,14 +225,16 @@ impl Frame {
 
     // -- geometry ----------------------------------------------------------
 
-    /// Client area origin in window coordinates.
+    /// Client area origin in frame coordinates.
     fn origin(&self) -> (i32, i32) {
-        (BORDER, BORDER + TITLE_H + MENU_H)
+        let menu = if self.dlg.menu.is_some() { MENU_H } else { 0 };
+        (BORDER, BORDER + TITLE_H + menu)
     }
 
     fn control_rect(&self, c: &Control) -> (i32, i32, i32, i32) {
         let (ox, oy) = self.origin();
-        (ox + c.x * DLU, oy + c.y * DLU, c.w * DLU, c.h * DLU)
+        let (fx, fy) = self.state.offset;
+        (fx + ox + c.x * DLU, fy + oy + c.y * DLU, c.w * DLU, c.h * DLU)
     }
 
     fn menubar_item_rect(&self, idx: usize, fonts: &mut Fonts) -> (i32, i32, i32, i32) {
@@ -345,6 +411,18 @@ impl Frame {
                 let c = &self.dlg.controls[idx];
                 match c.kind {
                     ControlKind::Button | ControlKind::BorBtn => return Some(UiEvent::Button(c.id)),
+                    ControlKind::BorRadio => {
+                        // Radio: checking one clears all the others (single
+                        // group per dialog, like the original templates).
+                        self.check_radio(c.id);
+                        return Some(UiEvent::Button(c.id));
+                    }
+                    ControlKind::BorCheck => {
+                        let on = !self.state.checked.contains(&c.id);
+                        self.check(c.id, on);
+                        return Some(UiEvent::Button(c.id));
+                    }
+                    ControlKind::BmpView => return Some(UiEvent::Button(c.id)),
                     _ => {}
                 }
             }
@@ -362,19 +440,32 @@ impl Frame {
 
     pub fn render(&mut self, surf: &mut Surface, fonts: &mut Fonts) {
         let (ww, wh) = self.window_size();
+        let (fx, fy) = self.state.offset;
 
         // Window frame + background.
-        surf.fill(FACE);
-        surf.frame(0, 0, ww, wh, INNER_LIGHT, DKSHADOW);
-        surf.frame(1, 1, ww - 2, wh - 2, WHITE, SHADOW);
+        surf.rect(fx, fy, ww, wh, FACE);
+        surf.frame(fx, fy, ww, wh, INNER_LIGHT, DKSHADOW);
+        surf.frame(fx + 1, fy + 1, ww - 2, wh - 2, WHITE, SHADOW);
 
-        // Title bar.
+        // Title bar (minimize button only on windows with WS_MINIMIZEBOX).
         let title = self.dlg.caption.unwrap_or("");
         let icon = self.cached_icon16("ZARROSIM");
-        title_bar(surf, fonts, BORDER, BORDER, ww - 2 * BORDER, title, icon.as_ref());
+        let show_min = self.dlg.style & 0x0002_0000 != 0; // WS_MINIMIZEBOX
+        title_bar(
+            surf,
+            fonts,
+            fx + BORDER,
+            fy + BORDER,
+            ww - 2 * BORDER,
+            title,
+            icon.as_ref(),
+            show_min,
+        );
 
-        // Menu bar.
-        self.render_menubar(surf, fonts);
+        // Menu bar (only the main window has one).
+        if self.dlg.menu.is_some() {
+            self.render_menubar(surf, fonts);
+        }
 
         // Client area.
         let (ox, oy) = self.origin();
@@ -486,12 +577,16 @@ impl Frame {
                 self.render_button(surf, fonts, c, x, y, w, h, pressed);
             }
             ControlKind::BorRadio => {
-                radio(surf, x, y + (h - 12) / 2, false);
-                fonts.regular.draw_accel_text(surf, &strip_accel(c.text), x + 16, y + 1, BLACK);
+                let checked = self.state.checked.contains(&c.id);
+                radio(surf, x, y + (h - 12) / 2, checked);
+                let text = self.text(c).to_string(); // borrow dance: self.text() borrows self
+                fonts.regular.draw_accel_text(surf, &text, x + 16, y + 1, BLACK);
             }
             ControlKind::BorCheck => {
-                checkbox(surf, x, y + 1, false);
-                fonts.regular.draw_accel_text(surf, &strip_accel(c.text), x + 18, y + 1, BLACK);
+                let checked = self.state.checked.contains(&c.id);
+                checkbox(surf, x, y + 1, checked);
+                let text = self.text(c).to_string();
+                fonts.regular.draw_accel_text(surf, &text, x + 18, y + 1, BLACK);
             }
             ControlKind::BorStatic => {
                 self.render_text(surf, fonts, c, x, y, w, h, BLACK);
@@ -499,7 +594,8 @@ impl Frame {
             ControlKind::Static => {
                 if c.style & 0xF == 3 {
                     // SS_ICON: the control text names the icon resource.
-                    if let Some(icon) = self.cached_icon(c.text) {
+                    let icon_name = self.text(c).to_string();
+                    if let Some(icon) = self.cached_icon(&icon_name) {
                         surf.blit(&icon, x, y);
                     }
                 } else {
@@ -554,11 +650,12 @@ impl Frame {
         } else {
             raised_button(surf, x, y, w, h);
         }
-        let label = strip_accel(c.text);
+        let text = self.text(c).to_string();
+        let label = strip_accel(&text);
         let tw = fonts.regular.text_width(&label);
         let tx = x + (w - tw) / 2 + pressed as i32;
         let ty = y + (h - fonts.regular.line_height()) / 2 + pressed as i32;
-        fonts.regular.draw_accel_text(surf, c.text, tx, ty, BLACK);
+        fonts.regular.draw_accel_text(surf, &text, tx, ty, BLACK);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -576,8 +673,9 @@ impl Frame {
         let align_center = c.style & 0xF == 1; // SS_CENTER
         let align_right = c.style & 0xF == 2; // SS_RIGHT
         let no_prefix = c.style & 0x80 != 0; // SS_NOPREFIX
+        let text = self.text(c).to_string();
         let mut yy = y;
-        for line in c.text.split('\n') {
+        for line in text.split('\n') {
             let label = if no_prefix { line.to_string() } else { strip_accel(line) };
             let tw = fonts.regular.text_width(&label);
             let tx = if align_center {
@@ -618,5 +716,124 @@ fn strip_accel(s: &str) -> String {
 }
 
 fn is_clickable(c: &Control) -> bool {
-    matches!(c.kind, ControlKind::Button | ControlKind::BorBtn | ControlKind::BmpView)
+    matches!(
+        c.kind,
+        ControlKind::Button
+            | ControlKind::BorBtn
+            | ControlKind::BorRadio
+            | ControlKind::BorCheck
+            | ControlKind::BmpView
+    )
+}
+
+/// Buttons of a message box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsgBoxButtons {
+    Ok,
+    YesNo,
+}
+
+/// Win95-style message box: title bar, text, buttons.
+///
+/// Templates are synthesized at runtime and cached by content: the game
+/// repeats the same messages over a session, so the set stays bounded.
+pub fn message_box(title: &str, text: &str, buttons: MsgBoxButtons) -> Frame {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<(String, String, bool), &'static Dialog>> = RefCell::new(HashMap::new());
+    }
+
+    CACHE.with(|cache| {
+        let key = (title.to_string(), text.to_string(), buttons == MsgBoxButtons::YesNo);
+        if let Some(dlg) = cache.borrow().get(&key) {
+            return Frame::from_dialog(dlg);
+        }
+
+        let lines: Vec<&str> = text.split('\n').collect();
+        // Geometry in dialog units (1 unit = 2 px), estimated from the text:
+        // MS Sans Serif at 11px averages ~6px per character.
+        let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10) as i32;
+        let w = ((max_chars * 6 + 70) / 2).clamp(90, 160);
+        let h = (lines.len() as i32 * 13 + 60) / 2 + 6;
+
+        let leak = |s: &str| -> &'static str { Box::leak(s.to_string().into_boxed_str()) };
+
+        let mut controls: Vec<Control> = Vec::new();
+        // Text lines (like the original MessageBox body).
+        for (i, line) in lines.iter().enumerate() {
+            controls.push(Control {
+                id: -(i as i32) - 10,
+                kind: ControlKind::BorStatic,
+                class: "BorStatic",
+                text: leak(line),
+                style: 0x4000_0000 | 0x1000_0000 | 0x0002_0000, // SS_LEFT(0)|WS_CHILD|WS_VISIBLE|WS_GROUP
+                x: 14,
+                y: 8 + i as i32 * 7,
+                w: w - 26,
+                h: 7,
+            });
+        }
+        match buttons {
+            MsgBoxButtons::Ok => {
+                controls.push(ok_button(w / 2 - 16, h - 16));
+            }
+            MsgBoxButtons::YesNo => {
+                controls.push(Control {
+                    id: 6, // IDYES
+                    kind: ControlKind::BorBtn,
+                    class: "BorBtn",
+                    text: "Si'",
+                    style: 0x1 | 0x4000_0000 | 0x1000_0000 | 0x0001_0000,
+                    x: w / 2 - 34,
+                    y: h - 16,
+                    w: 33,
+                    h: 11,
+                });
+                controls.push(Control {
+                    id: 7, // IDNO
+                    kind: ControlKind::BorBtn,
+                    class: "BorBtn",
+                    text: "No",
+                    style: 0x4000_0000 | 0x1000_0000 | 0x0001_0000,
+                    x: w / 2 + 1,
+                    y: h - 16,
+                    w: 33,
+                    h: 11,
+                });
+            }
+        }
+
+        let dlg: &'static Dialog = Box::leak(Box::new(Dialog {
+            id: 0xFFFF, // runtime-only dialog
+            style: 0x40 | 0x80 | 0x8000_0000 | 0x00C0_0000 | 0x0008_0000, // DS_SETFONT|DS_MODALFRAME|WS_POPUP|WS_CAPTION|WS_SYSMENU
+            caption: Some(leak(title)),
+            menu: None,
+            class: Some("Bordlg"),
+            font_size: Some(10),
+            font_name: Some("MS Sans Serif"),
+            x: 0,
+            y: 0,
+            w,
+            h,
+            controls: Box::leak(controls.into_boxed_slice()),
+        }));
+        cache.borrow_mut().insert(key, dlg);
+        Frame::from_dialog(dlg)
+    })
+}
+
+/// The OK button of a message box (BorBtn, id 1 = IDOK).
+fn ok_button(x: i32, y: i32) -> Control {
+    Control {
+        id: 1,
+        kind: ControlKind::BorBtn,
+        class: "BorBtn",
+        text: "OK",
+        style: 0x1 | 0x4000_0000 | 0x1000_0000 | 0x0001_0000, // BS_DEFPUSHBUTTON|...
+        x,
+        y,
+        w: 33,
+        h: 11,
+    }
 }

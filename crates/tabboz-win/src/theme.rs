@@ -133,7 +133,17 @@ pub fn checkbox(s: &mut Surface, x: i32, y: i32, checked: bool) {
 }
 
 /// Title bar of an active BWCC window.
-pub fn title_bar(s: &mut Surface, fonts: &mut Fonts, x: i32, y: i32, w: i32, title: &str, icon: Option<&crate::pixel::Image>) {
+#[allow(clippy::too_many_arguments)]
+pub fn title_bar(
+    s: &mut Surface,
+    fonts: &mut Fonts,
+    x: i32,
+    y: i32,
+    w: i32,
+    title: &str,
+    icon: Option<&crate::pixel::Image>,
+    show_min: bool,
+) {
     s.rect(x, y, w, TITLE_H, NAVY);
     let mut tx = x + 3;
     if let Some(img) = icon {
@@ -141,8 +151,11 @@ pub fn title_bar(s: &mut Surface, fonts: &mut Fonts, x: i32, y: i32, w: i32, tit
         tx += 16 + 3;
     }
     fonts.bold.draw_text(s, title, tx, y + 3, WHITE);
-    // Caption buttons: minimize and close (main window has WS_MINIMIZEBOX).
-    draw_sys_button(s, x + w - 13 - 17, y + 2, SysButton::Minimize);
+    // Caption buttons: minimize and close for the main window (WS_MINIMIZEBOX),
+    // close only for modal dialogs.
+    if show_min {
+        draw_sys_button(s, x + w - 13 - 17, y + 2, SysButton::Minimize);
+    }
     draw_sys_button(s, x + w - 13 - 2, y + 2, SysButton::Close);
 }
 

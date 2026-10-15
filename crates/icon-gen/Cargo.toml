@@ -1,0 +1,17 @@
+# Tabboz Simulator - Rust port
+
+# Tabboz Simulator 1997-2000 Andrea Bonomi; this port is GPL-3.0-or-later.
+
+[package]
+name = "icon-gen"
+description = "Tabboz Simulator: build-time .app icon generator (ico -> iconset)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "icon-gen"
+path = "src/main.rs"
+
+[dependencies]
+tabboz-win = { path = "../tabboz-win" }

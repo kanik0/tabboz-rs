@@ -5,6 +5,7 @@ members = [
     "crates/tabboz-res",
     "crates/tabboz-win",
     "crates/tabboz-app",
+    "crates/icon-gen",
 ]
 
 [workspace.package]
