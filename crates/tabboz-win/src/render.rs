@@ -530,7 +530,6 @@ impl Frame {
     }
 
     /// Decoded bitmap by resource name (used from milestone 4 for shop previews).
-    #[allow(dead_code)]
     fn cached_bitmap(&mut self, name: &str) -> Option<Image> {
         if !self.state.cache.contains_key(name) {
             let img = asset_bitmap(name)?;
@@ -610,16 +609,25 @@ impl Frame {
         }
         match c.kind {
             ControlKind::Button | ControlKind::BorBtn => {
-                // BWCC bitmap buttons: the .rc templates carry empty-text
-                // BorBtn for OK (id 1) and Cancel (id 2); the button faces
-                // are the chrome bitmaps 1001/1002 (the web port does the
-                // same with CSS backgrounds).
+                // BWCC bitmap buttons. OK/Cancel (ids 1/2) carry an empty
+                // text in the .rc templates and draw the chrome faces
+                // 1001/1002 centered. Every OTHER empty-text BorBtn shows
+                // the game bitmap whose resource id is the control id + 1000
+                // (shop previews, firm logos, phone photos, trucca images,
+                // the About picture...), stretched to the control rect —
+                // the same id mapping and sizing the web port uses.
                 let text = self.text(c);
-                if c.kind == ControlKind::BorBtn && text.is_empty() && matches!(c.id, 1 | 2) {
-                    let bmp = if c.id == 1 { "1001" } else { "1002" };
-                    if let Some(img) = self.cached_chrome(bmp) {
-                        let (ox, oy) = ((w - img.w) / 2, (h - img.h) / 2);
-                        surf.blit(&img, x + ox, y + oy);
+                if c.kind == ControlKind::BorBtn && text.is_empty() {
+                    if matches!(c.id, 1 | 2) {
+                        let bmp = if c.id == 1 { "1001" } else { "1002" };
+                        if let Some(img) = self.cached_chrome(bmp) {
+                            let (ox, oy) = ((w - img.w) / 2, (h - img.h) / 2);
+                            surf.blit(&img, x + ox, y + oy);
+                        }
+                    } else if let Some(img) = self.cached_bitmap(&(c.id + 1000).to_string()) {
+                        surf.blit_stretched(&img, x, y, w, h);
+                    } else {
+                        self.render_button(surf, fonts, c, x, y, w, h, false);
                     }
                     return;
                 }

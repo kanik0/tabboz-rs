@@ -151,6 +151,9 @@ impl App {
             }
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create dialog window"));
+        // DialogBox activates the new dialog over its owner: without this
+        // the dialog can open BEHIND the still-visible main window.
+        window.focus_window();
         let ctx: softbuffer::Context<winit::event_loop::OwnedDisplayHandle> =
             softbuffer::Context::new(event_loop.owned_display_handle()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface");
@@ -172,11 +175,30 @@ impl App {
     }
 
     /// SW_HIDE / SW_SHOW of the original: the main window is hidden while
-    /// a game dialog is open.
+    /// a game dialog is open. When it comes back, it also regains focus,
+    /// like an owner window after DialogBox returns.
     fn refresh_main_visibility(&mut self) {
         if let Some(m) = &self.main {
             let hide = self.dialogs.values().any(|c| c.hides_main);
-            m.window.set_visible(!hide);
+            if hide {
+                m.window.set_visible(false);
+            } else {
+                let was_hidden = !m.window.is_visible().unwrap_or(false);
+                m.window.set_visible(true);
+                if was_hidden {
+                    m.window.focus_window();
+                }
+            }
+        }
+    }
+
+    /// When the last dialog closes, activation goes back to the owner
+    /// window (covers dialogs that never hid the main, e.g. About).
+    fn focus_main_if_forgotten(&mut self) {
+        if self.dialogs.is_empty() {
+            if let Some(m) = &self.main {
+                m.window.focus_window();
+            }
         }
     }
 
@@ -198,6 +220,7 @@ impl App {
         }
         self.dialogs.remove(&id);
         self.refresh_main_visibility();
+        self.focus_main_if_forgotten();
     }
 
     /// Closes the dialog window carrying this game token.
@@ -222,6 +245,7 @@ impl App {
             self.modal = None;
         }
         self.refresh_main_visibility();
+        self.focus_main_if_forgotten();
     }
 
     // ---- game requests ---------------------------------------------------

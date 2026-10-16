@@ -139,6 +139,25 @@ impl<'a> Surface<'a> {
         }
     }
 
+    /// Blits an image stretched to a logical rectangle (nearest neighbor),
+    /// one source sample per logical pixel. Mirrors the web port, which
+    /// sizes bitmap-button images with CSS width/height.
+    pub fn blit_stretched(&mut self, img: &Image, x: i32, y: i32, w: i32, h: i32) {
+        if img.w == 0 || img.h == 0 || w <= 0 || h <= 0 {
+            return;
+        }
+        for yy in 0..h {
+            let sy = yy * img.h / h;
+            for xx in 0..w {
+                let sx = xx * img.w / w;
+                let px = img.data[(sy * img.w + sx) as usize];
+                if px >> 24 != 0 {
+                    self.set(x + xx, y + yy, px & 0x00FF_FFFF);
+                }
+            }
+        }
+    }
+
     /// Blits an image clipped to a logical rectangle.
     /// The clip rect mirrors the shape of the Win32 bitblt call.
     #[allow(clippy::too_many_arguments)]

@@ -152,3 +152,29 @@ fn empty_ok_cancel_buttons_render_their_bwcc_bitmaps() {
     }
     assert!(ink > 300, "OK bitmap button not drawn: {ink} ink pixels");
 }
+
+#[test]
+fn about_dialog_renders_the_1257_bitmap_button() {
+    // Dialog 2 (About): CONTROL "", 257, "BorBtn", 20, 44, 146, 71 is a
+    // bitmap button showing game bitmap 1257 (control id + 1000) stretched
+    // to the control rect, like the web port <img> sizing.
+    let mut frame = Frame::new(2);
+    let mut fonts = Fonts::new(1);
+    let (w, h) = frame.window_size();
+    let mut buf = vec![0u32; (w * h) as usize];
+    {
+        let mut s = Surface::new(&mut buf, w, h, 1);
+        frame.render(&mut s, &mut fonts);
+    }
+    let get = |x: i32, y: i32| buf[(y * w + x) as usize];
+    // Client origin (2, 22): image at (42, 110), size 292x142.
+    let mut ink = 0;
+    for y in 112..250 {
+        for x in 44..332 {
+            if get(x, y) != tabboz_win::theme::FACE {
+                ink += 1;
+            }
+        }
+    }
+    assert!(ink > 5000, "About 1257 bitmap not drawn: {ink} ink pixels");
+}
