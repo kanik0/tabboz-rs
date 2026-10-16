@@ -136,13 +136,15 @@ impl App {
         let mut physical = vec![0u32; (pw * ph) as usize];
         {
             let mut s = Surface::new(&mut physical, lw, lh, scale);
+            // The whole window is the desktop: teal, like the web port.
+            // Everything (main window, dialogs, message boxes) floats on
+            // it; the margin around the main window shows as desktop, not
+            // as the black background of the buffer.
+            s.fill(tabboz_win::theme::TEAL);
             // Desktop mode: game dialogs hide the main window (like the
-            // original SW_HIDE) and float on the teal desktop of the web
-            // port; otherwise the main window stays and modals stack on it.
+            // original SW_HIDE); otherwise the main window stays up.
             let desktop = self.frames.iter().any(|f| f.hides_main);
-            if desktop {
-                s.fill(tabboz_win::theme::TEAL);
-            } else {
+            if !desktop {
                 self.main.render(&mut s, &mut self.fonts);
             }
             for open in &mut self.frames {
