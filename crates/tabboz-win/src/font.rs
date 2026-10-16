@@ -79,7 +79,7 @@ impl Face {
                 // antialiasing.
                 outlined.draw(|x, y, coverage| {
                     if x < w as u32 && y < h as u32 {
-                        bitmap[(y * w as u32 + x) as usize] = if coverage >= 0.5 { 255 } else { 0 };
+                        bitmap[(y * w as u32 + x) as usize] = if coverage >= 0.40 { 255 } else { 0 };
                     }
                 });
                 CachedGlyph {

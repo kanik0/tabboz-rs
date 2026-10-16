@@ -690,8 +690,13 @@ fn main() {
     let asset_count = gen_assets(&resources, &mut assets_code);
     fs::write(out_dir.join("assets.rs"), assets_code).expect("write assets.rs");
 
-    // Fonts: the MS Sans Serif webfonts bundled with the web port are WOFF
-    // (zlib-wrapped sfnt); convert them to plain TTF so ab_glyph can load them.
+    // Fonts: the bundled ms_sans_serif.woff IS 98.css "Pixelated MS Sans
+    // Serif" (byte-identical to the upstream 98.css repo): a pixel font
+    // designed on the 11px grid, like the original bitmap font. The WOFF
+    // is converted to plain TTF for ab_glyph. Note: ab_glyph does not run
+    // TrueType hinting, so the coverage bleeds half a pixel off-grid;
+    // font.rs compensates with a calibrated binary threshold (0.40)
+    // that reconstructs the intended bitmap glyphs.
     let mut fonts_code = String::new();
     let regular = woff_to_ttf(&fs::read(resources.join("css/ms_sans_serif.woff")).expect("read ms_sans_serif.woff"));
     let bold = woff_to_ttf(&fs::read(resources.join("css/ms_sans_serif_bold.woff")).expect("read ms_sans_serif_bold.woff"));
