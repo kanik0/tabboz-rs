@@ -276,3 +276,38 @@ fn message_box_wraps_long_lines_to_the_window() {
         .count();
     assert!(line_count >= 2, "text not wrapped: {line_count} lines");
 }
+
+#[test]
+fn bau_house_renders_previews_and_wrapped_descriptions() {
+    // Dialog 80 (Bau House): BorBtn BS_OWNERDRAW with junk "Button" text
+    // must draw the id+1000 preview bitmap; the SS_CENTER descriptions
+    // must word-wrap inside their rect (they used to overflow the card).
+    let mut frame = Frame::new(80);
+    let mut fonts = Fonts::new(1);
+    let (w, h) = frame.window_size();
+    let mut buf = vec![0u32; (w * h) as usize];
+    {
+        let mut s = Surface::new(&mut buf, w, h, 1);
+        frame.render(&mut s, &mut fonts);
+    }
+    let get = |x: i32, y: i32| buf[(y * w + x) as usize];
+    // Card 502: (96, 3) 88x62 DLU -> px (194, 28) 176x124. The bitmap
+    // (vestito) fills the card; a plain "Button" face would leave it flat.
+    let mut ink = 0;
+    for y in 40..140 {
+        for x in 200..360 {
+            if get(x, y) != tabboz_win::theme::FACE {
+                ink += 1;
+            }
+        }
+    }
+    assert!(ink > 3000, "card 502 preview not drawn: {ink} ink pixels");
+    // First description: (12, 78) 69x56 DLU -> rect ends at px x=164.
+    // The band between that rect and the shade line at x=188 must stay
+    // clean: overflowing description text would cross it.
+    for y in 182..286 {
+        for x in 166..186 {
+            assert_eq!(get(x, y), tabboz_win::theme::FACE, "description leaks at ({x},{y})");
+        }
+    }
+}

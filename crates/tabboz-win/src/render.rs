@@ -633,14 +633,16 @@ impl Frame {
             ControlKind::Button | ControlKind::BorBtn => {
                 // BWCC bitmap buttons. OK/Cancel (ids 1/2) carry an empty
                 // text in the .rc templates and draw the chrome faces
-                // 1001/1002 centered. Every OTHER empty-text BorBtn shows
-                // the game bitmap whose resource id is the control id + 1000
-                // (shop previews, firm logos, phone photos, trucca images,
-                // the About picture...), stretched to the control rect —
-                // the same id mapping and sizing the web port uses.
+                // 1001/1002 centered. BS_OWNERDRAW (0x8000) BorBtns —
+                // with empty OR junk text ("Button" leftovers of the
+                // resource editor) — show the game bitmap whose resource
+                // id is the control id + 1000 (shop previews, firm logos,
+                // phone photos, trucca images, the About picture...),
+                // stretched to the control rect: the same id mapping and
+                // sizing the web port uses.
                 let text = self.text(c);
-                if c.kind == ControlKind::BorBtn && text.is_empty() {
-                    if matches!(c.id, 1 | 2) {
+                if c.kind == ControlKind::BorBtn && (text.is_empty() || c.style & 0x8000 != 0) {
+                    if matches!(c.id, 1 | 2) && text.is_empty() {
                         let bmp = if c.id == 1 { "1001" } else { "1002" };
                         if let Some(img) = self.cached_chrome(bmp) {
                             let (ox, oy) = ((w - img.w) / 2, (h - img.h) / 2);
@@ -784,25 +786,44 @@ impl Frame {
         let align_right = c.style & 0xF == 2; // SS_RIGHT
         let no_prefix = c.style & 0x80 != 0; // SS_NOPREFIX
         let text = self.text(c).to_string();
+        // Win32 static controls word-wrap by default: the long shop-item
+        // descriptions (Bau House &c.) fit their SS_CENTER rect.
         let mut yy = y;
-        for line in text.split('\n') {
-            let label = if no_prefix { line.to_string() } else { strip_accel(line) };
-            let tw = fonts.regular.text_width(&label);
-            let tx = if align_center {
-                x + (w - tw) / 2
-            } else if align_right {
-                x + w - tw
-            } else {
-                x
-            };
-            if no_prefix {
-                fonts.regular.draw_text(surf, line, tx, yy, color);
-            } else {
-                fonts.regular.draw_accel_text(surf, line, tx, yy, color);
+        'outer: for para in text.split('\n') {
+            let mut wrapped: Vec<String> = vec![String::new()];
+            for word in para.split(' ') {
+                let cur = wrapped.last_mut().unwrap();
+                let candidate = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+                let measured = if no_prefix {
+                    candidate.clone()
+                } else {
+                    strip_accel(&candidate)
+                };
+                if !cur.is_empty() && fonts.regular.text_width(&measured) > w {
+                    wrapped.push(word.to_string());
+                } else {
+                    *cur = candidate;
+                }
             }
-            yy += fonts.regular.line_height();
-            if yy >= y + h {
-                break;
+            for line in &wrapped {
+                let label = if no_prefix { line.clone() } else { strip_accel(line) };
+                let tw = fonts.regular.text_width(&label);
+                let tx = if align_center {
+                    x + (w - tw) / 2
+                } else if align_right {
+                    x + w - tw
+                } else {
+                    x
+                };
+                if no_prefix {
+                    fonts.regular.draw_text(surf, line, tx, yy, color);
+                } else {
+                    fonts.regular.draw_accel_text(surf, line, tx, yy, color);
+                }
+                yy += fonts.regular.line_height();
+                if yy >= y + h {
+                    break 'outer;
+                }
             }
         }
     }
