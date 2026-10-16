@@ -27,6 +27,8 @@ fn contrast(c: f32) -> u8 {
 
 pub struct Face {
     font: PxScaleFont<FontArc>,
+    /// Regular face used for glyphs the main face lacks (bold fallback).
+    fallback: Option<PxScaleFont<FontArc>>,
     cache: HashMap<char, CachedGlyph>,
     /// Integer upscale factor: glyphs are rasterized at TEXT_SIZE * scale.
     scale: i32,
@@ -49,13 +51,26 @@ struct CachedGlyph {
 
 impl Face {
     pub fn new(data: &[u8], scale: i32) -> Self {
+        Self::with_fallback(data, None, scale)
+    }
+
+    /// The Pixelated MS Sans Serif bold face shipped by 98.css lacks most
+    /// punctuation (" ' * + , . / < = > ? \ _ |); browsers paper over this
+    /// with the CSS font-family fallback chain, so the port rasterizes
+    /// missing glyphs from the regular face instead of the .notdef box.
+    pub fn with_fallback(data: &[u8], fallback_data: Option<&[u8]>, scale: i32) -> Self {
         let font = FontArc::try_from_vec(data.to_vec()).expect("valid font");
         let size = TEXT_SIZE * scale as f32;
         let scaled: PxScaleFont<FontArc> = font.into_scaled(PxScale::from(size));
         let ascent = scaled.ascent();
         let descent = scaled.descent();
+        let fallback = fallback_data.map(|d| {
+            let fb = FontArc::try_from_vec(d.to_vec()).expect("valid font");
+            fb.into_scaled(PxScale::from(size))
+        });
         Face {
             font: scaled,
+            fallback,
             cache: HashMap::new(),
             scale,
             ascent,
@@ -69,8 +84,11 @@ impl Face {
     }
 
     fn glyph(&mut self, c: char) -> &CachedGlyph {
-        let font = &self.font;
+        let main = self.font.clone();
+        let fallback = self.fallback.clone();
         self.cache.entry(c).or_insert_with(|| {
+            let missing = main.glyph_id(c).0 == 0;
+            let font = if missing { fallback.unwrap_or(main) } else { main };
             let glyph_id = font.glyph_id(c);
             let advance = font.h_advance(glyph_id);
             // Rasterize at the origin on the physical grid; the draw
@@ -191,7 +209,7 @@ impl Fonts {
     pub fn new(scale: i32) -> Self {
         Fonts {
             regular: Face::new(crate::fonts::FONT_REGULAR, scale),
-            bold: Face::new(crate::fonts::FONT_BOLD, scale),
+            bold: Face::with_fallback(crate::fonts::FONT_BOLD, Some(crate::fonts::FONT_REGULAR), scale),
             scale,
         }
     }

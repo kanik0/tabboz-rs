@@ -263,10 +263,12 @@ impl App {
                 for id in checks {
                     frame.check(id, true);
                 }
-                // Game dialogs hide the main window (ShowWindow(WIN_PICCOLO));
-                // about/personal info/config/logo/spegnimi keep it visible.
-                let hides_main = !keeps_main_visible(dlg_id);
-                self.open_window(event_loop, frame, token, hides_main, None);
+                // Every game dialog hides the main window
+                // (ShowWindow(WIN_PICCOLO)); without this macOS can leave
+                // the dialog BEHIND the main, and a modal-blocked main
+                // would make the app unusable (About, PersonalInfo,
+                // Config, Logo included).
+                self.open_window(event_loop, frame, token, true, None);
             }
             UiRequest::CloseFrame { token } => {
                 self.close_dialog_token(token);
@@ -386,12 +388,6 @@ fn title_bar_drag_hit(frame: &Frame, lx: i32, ly: i32) -> bool {
         13
     };
     lx < fw - tabboz_win::theme::BORDER - buttons_w
-}
-
-/// Dialogs that the original opens WITHOUT hiding the main window
-/// (no ShowWindow(WIN_PICCOLO) call in WM_COMMAND).
-fn keeps_main_visible(dlg_id: u32) -> bool {
-    matches!(dlg_id, 2 | 11 | 12 | 14 | 15 | 16) // About, PersonalInfo, Logo, Configuration, Format, Spegnimi
 }
 
 impl ApplicationHandler<UiRequest> for App {

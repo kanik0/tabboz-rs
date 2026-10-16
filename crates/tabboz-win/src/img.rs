@@ -45,7 +45,9 @@ pub fn decode_bmp(d: &[u8]) -> Result<Image, String> {
     let compression = u32le(d, 30);
     let clr_used = u32le(d, 46) as usize;
 
-    if compression != 0 && !(compression == 1 && bpp == 8) {
+    if compression != 0
+        && !((compression == 1 && bpp == 8) || (compression == 2 && bpp == 4))
+    {
         return Err(format!("unsupported BMP compression {compression} (bpp {bpp})"));
     }
 
@@ -122,6 +124,58 @@ pub fn decode_bmp(d: &[u8]) -> Result<Image, String> {
                             }
                             pos += n as usize;
                             if n % 2 == 1 {
+                                pos += 1; // word padding
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        4 if compression == 2 => {
+            // RLE4: <count, nibbles-byte>; encoded runs alternate the two
+            // nibbles of the value byte, literal escapes carry packed nibbles.
+            let mut pos = data_offset;
+            let (mut x, mut y) = (0i32, 0i32);
+            while pos + 1 < d.len() {
+                let count = d[pos] as usize;
+                let value = d[pos + 1];
+                pos += 2;
+                if count > 0 {
+                    for i in 0..count {
+                        let nibble = if i % 2 == 0 { value >> 4 } else { value & 0xF };
+                        if x < w {
+                            put(&mut data, x, y, pal[nibble as usize]);
+                        }
+                        x += 1;
+                    }
+                } else {
+                    match value {
+                        0 => { // end of line
+                            x = 0;
+                            y += 1;
+                        }
+                        1 => break, // end of bitmap
+                        2 => { // delta
+                            if pos + 1 >= d.len() {
+                                break;
+                            }
+                            x += d[pos] as i32;
+                            y += d[pos + 1] as i32;
+                            pos += 2;
+                        }
+                        n => { // literal run: n pixels packed two per byte
+                            let n = n as usize;
+                            for i in 0..n {
+                                let byte = d[pos + i / 2];
+                                let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0xF };
+                                if x < w {
+                                    put(&mut data, x, y, pal[nibble as usize]);
+                                }
+                                x += 1;
+                            }
+                            let bytes = n.div_ceil(2);
+                            pos += bytes;
+                            if bytes % 2 == 1 {
                                 pos += 1; // word padding
                             }
                         }
@@ -272,6 +326,14 @@ mod tests {
         let pantaloni = bmp("1520");
         assert_eq!((pantaloni.w, pantaloni.h), (84, 153));
         assert!(pantaloni.data.iter().any(|p| *p != pantaloni.data[0]));
+    }
+
+    #[test]
+    fn decodes_rle4_compagnia_photo() {
+        // 1259: compagnia photo, 4-bit RLE4 (the only RLE4 game bitmap).
+        let img = bmp("1259");
+        assert_eq!((img.w, img.h), (287, 184));
+        assert!(img.data.iter().any(|p| *p != img.data[0]));
     }
 
     #[test]

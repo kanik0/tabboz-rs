@@ -178,3 +178,49 @@ fn about_dialog_renders_the_1257_bitmap_button() {
     }
     assert!(ink > 5000, "About 1257 bitmap not drawn: {ink} ink pixels");
 }
+
+#[test]
+fn compagnia_dialog_renders_the_rle4_photo() {
+    // Dialog 6 (Compagnia): CONTROL "", 259, "BorBtn", ..., 4, 3, 144, 92
+    // draws the RLE4-compressed photo 1259 stretched to the control rect.
+    let mut frame = Frame::new(6);
+    let mut fonts = Fonts::new(1);
+    let (w, h) = frame.window_size();
+    let mut buf = vec![0u32; (w * h) as usize];
+    {
+        let mut s = Surface::new(&mut buf, w, h, 1);
+        frame.render(&mut s, &mut fonts);
+    }
+    let get = |x: i32, y: i32| buf[(y * w + x) as usize];
+    // Client origin (2, 22): image at (10, 28), size 288x184.
+    let mut ink = 0;
+    for y in 32..208 {
+        for x in 14..294 {
+            if get(x, y) != tabboz_win::theme::FACE {
+                ink += 1;
+            }
+        }
+    }
+    assert!(ink > 10000, "Compagnia photo not drawn: {ink} ink pixels");
+}
+
+#[test]
+fn bold_face_falls_back_to_regular_for_missing_punctuation() {
+    // The 98.css bold face lacks " ' * + , . / < = > ? \ _ | ; the regular
+    // face must supply those glyphs instead of the .notdef box.
+    use tabboz_win::font::Fonts;
+    use tabboz_win::pixel::Surface;
+    use tabboz_win::theme::WHITE;
+    let mut fonts = Fonts::new(2);
+    let (w, h) = (40, 20);
+    let mut buf = vec![0u32; (w * h * 4) as usize];
+    {
+        let mut s = Surface::new(&mut buf, w, h, 2);
+        fonts.bold.draw_text(&mut s, "...", 2, 2, WHITE);
+    }
+    let ink = buf.iter().filter(|&&p| p != 0).count();
+    // Three dots, 2 physical px each at scale 2: tiny — the old .notdef
+    // box drew ~150.
+    assert!(ink <= 30, "bold dots drew a notdef box: {ink} ink pixels");
+    assert!(ink > 0, "bold dots drew nothing");
+}
