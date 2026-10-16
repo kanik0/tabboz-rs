@@ -58,6 +58,17 @@ pub fn shade_box(s: &mut Surface, x: i32, y: i32, w: i32, h: i32) {
     s.frame(x, y, w, h, SHADOW, WHITE);
 }
 
+/// BUTTON BS_GROUPBOX: etched frame, like the Win95 group box the label
+/// text overlays at the top-left.
+pub fn group_box(s: &mut Surface, x: i32, y: i32, w: i32, h: i32) {
+    if w < 1 || h < 1 {
+        return;
+    }
+    s.frame(x, y, w, h, SHADOW, WHITE);
+    s.hline(x + 1, y + h - 2, w - 2, WHITE);
+    s.vline(x + w - 2, y + 1, h - 2, WHITE);
+}
+
 /// BorShade 0x2: sunken horizontal dip.
 pub fn shade_hdip(s: &mut Surface, x: i32, y: i32, w: i32, h: i32) {
     s.rect(x, y, w, h.min(1), SHADOW);

@@ -331,7 +331,18 @@ impl App {
                         (f, false)
                     }
                 };
-                self.open_window(event_loop, frame, 0, false, Some(Ask { reply, yes_no }));
+                // A message box opened while the main window is visible must
+                // hide it (macOS can stack the box BEHIND the still-visible
+                // main, and the modal-blocked main would freeze the app —
+                // File->Apri/Salva con nome). Boxes opened from a game
+                // dialog leave visibility alone: the main is already
+                // hidden and the dialog owns the screen.
+                let hides_main = self
+                    .main
+                    .as_ref()
+                    .map(|m| m.window.is_visible().unwrap_or(false))
+                    .unwrap_or(false);
+                self.open_window(event_loop, frame, 0, hides_main, Some(Ask { reply, yes_no }));
             }
         }
     }

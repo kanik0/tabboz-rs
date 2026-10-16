@@ -556,12 +556,8 @@ impl Game {
     }
 
     fn on_closed(&mut self, token: u64) {
-        if self.handler_of(token) == Some(Handler::Spegnimi) {
-            // OK on Spegnimi: quit (radio 101) — radio 102 would "shutdown".
-            if self.shutdown == 1 {
-                let _ = self.bridge.tx.send_event(UiRequest::Quit);
-            }
-        }
+        // The dialog close button (X) is IDCANCEL in the original: it only
+        // ends the dialog, never the application (Spegnimi included).
         self.close(token);
     }
 
@@ -1547,13 +1543,23 @@ impl Game {
         match id {
             101 => self.shutdown = 1,
             102 => self.shutdown = 2,
-            _ => {
-                if self.shutdown == 1 {
-                    crate::save::save(&self.state);
-                    let _ = self.bridge.tx.send_event(UiRequest::Quit);
-                }
+            // Help: the Progresso joke of the original, dialog stays open.
+            110 => self.message(
+                "Guida del Tabboz Simulator",
+                "'Spegni il computer ed esci di casa'\n\nPubblicita' Progresso per il recupero dei giovani disadattati a causa dei computer sponsorizzata da Obscured Truckware.",
+            ),
+            // IDOK: boolean_shutdown != 0 closes the main dialog — the app
+            // exits (ExitWindows of radio 102 is outside this port's scope).
+            1 => {
+                crate::save::save(&self.state);
+                let _ = self.bridge.tx.send_event(UiRequest::Quit);
+            }
+            // IDCANCEL: back to the game, boolean_shutdown = 0.
+            2 => {
+                self.shutdown = 0;
                 self.close(token);
             }
+            _ => {}
         }
     }
 }
@@ -2785,6 +2791,9 @@ impl Game {
             110 => {
                 self.state.sound_active = !self.state.sound_active;
             }
+            // Startup Logo / Enable Timer: the original toggles settings the
+            // port does not model; the click only flips the visual box.
+            106 | 108 => {}
             203 => {
                 // Reset: dialog 15 (scelta del sesso).
                 self.format_sesso = if self.rng.random(2) == 1 { 'M' } else { 'F' };

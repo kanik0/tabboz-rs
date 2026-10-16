@@ -188,13 +188,23 @@ impl Frame {
             .dlg
             .controls
             .iter()
-            .filter(|c| c.kind == ControlKind::BorRadio)
+            .filter(|c| is_radio(c))
             .map(|c| c.id)
             .collect();
         for r in radios {
             self.state.checked.remove(&r);
         }
         self.state.checked.insert(id);
+    }
+
+    /// Whether a radio/checkbox control is currently checked.
+    pub fn is_checked(&self, id: i32) -> bool {
+        self.state.checked.contains(&id)
+    }
+
+    /// The dialog template this frame renders.
+    pub fn dlg(&self) -> &'static Dialog {
+        self.dlg
     }
 
     /// Position of this frame inside the window surface (modal dialogs).
@@ -436,11 +446,22 @@ impl Frame {
                 let c = &self.dlg.controls[idx];
                 let (cx, cy, _, _) = self.control_rect(c);
                 self.state.last_click = Some((x - cx, y - cy));
+                // BUTTON-class radios/checkboxes pick their behavior from
+                // the BS_* style nibble, not from the control kind.
+                if is_radio(c) {
+                    // Radio: checking one clears all the others (single
+                    // group per dialog, like the original templates).
+                    self.check_radio(c.id);
+                    return Some(UiEvent::Button(c.id));
+                }
+                if is_checkbox(c) {
+                    let on = !self.state.checked.contains(&c.id);
+                    self.check(c.id, on);
+                    return Some(UiEvent::Button(c.id));
+                }
                 match c.kind {
                     ControlKind::Button | ControlKind::BorBtn => return Some(UiEvent::Button(c.id)),
                     ControlKind::BorRadio => {
-                        // Radio: checking one clears all the others (single
-                        // group per dialog, like the original templates).
                         self.check_radio(c.id);
                         return Some(UiEvent::Button(c.id));
                     }
@@ -452,6 +473,7 @@ impl Frame {
                     ControlKind::BmpView => return Some(UiEvent::Button(c.id)),
                     _ => {}
                 }
+                return None;
             }
             return None; // redraw is driven by the caller via needs_redraw()
         }
@@ -632,6 +654,29 @@ impl Frame {
                     return;
                 }
                 let pressed = self.state.pressed_control == Some(idx);
+                // Plain BUTTON-class controls pick their look from the
+                // BS_* style nibble, like the web port (input type=radio /
+                // type=checkbox / fieldset).
+                if is_radio(c) {
+                    let checked = self.state.checked.contains(&c.id);
+                    radio(surf, x, y + (h - 12) / 2, checked);
+                    let text = self.text(c).to_string(); // borrow dance: self.text() borrows self
+                    fonts.regular.draw_accel_text(surf, &text, x + 16, y + 1, BLACK);
+                    return;
+                }
+                if is_checkbox(c) {
+                    let checked = self.state.checked.contains(&c.id);
+                    checkbox(surf, x, y + 1, checked);
+                    let text = self.text(c).to_string();
+                    fonts.regular.draw_accel_text(surf, &text, x + 18, y + 1, BLACK);
+                    return;
+                }
+                if is_groupbox(c) {
+                    group_box(surf, x, y, w, h);
+                    let text = self.text(c).to_string();
+                    fonts.regular.draw_accel_text(surf, &text, x + 8, y + 1, BLACK);
+                    return;
+                }
                 self.render_button(surf, fonts, c, x, y, w, h, pressed);
             }
             ControlKind::BorRadio => {
@@ -780,7 +825,32 @@ fn strip_accel(s: &str) -> String {
     out
 }
 
+/// BS_* flavor of a BUTTON-class control (low nibble of the style).
+fn bs_style(c: &Control) -> u32 {
+    c.style & 0xF
+}
+
+/// A radio button: BorRadio class, or BUTTON with BS_AUTORADIOBUTTON (9).
+fn is_radio(c: &Control) -> bool {
+    c.kind == ControlKind::BorRadio || (c.kind == ControlKind::Button && bs_style(c) == 9)
+}
+
+/// A checkbox: BorCheck class, or BUTTON with BS_CHECKBOX (2),
+/// BS_AUTOCHECKBOX (3), BS_3STATE (5), BS_AUTO3STATE (6).
+fn is_checkbox(c: &Control) -> bool {
+    c.kind == ControlKind::BorCheck || (c.kind == ControlKind::Button && matches!(bs_style(c), 2 | 3 | 5 | 6))
+}
+
+/// A group box: BUTTON with BS_GROUPBOX (7) — etched frame with a label.
+fn is_groupbox(c: &Control) -> bool {
+    c.kind == ControlKind::Button && bs_style(c) == 7
+}
+
 fn is_clickable(c: &Control) -> bool {
+    if is_groupbox(c) || c.style & 0x0800_0000 != 0 {
+        // BS_GROUPBOX is decoration; WS_DISABLED controls ignore input.
+        return false;
+    }
     matches!(
         c.kind,
         ControlKind::Button
@@ -815,11 +885,28 @@ pub fn message_box(title: &str, text: &str, buttons: MsgBoxButtons) -> Frame {
             return Frame::from_dialog(dlg);
         }
 
-        let lines: Vec<&str> = text.split('\n').collect();
-        // Geometry in dialog units (1 unit = 2 px), estimated from the text:
-        // MS Sans Serif at 11px averages ~6px per character.
-        let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10) as i32;
-        let w = ((max_chars * 6 + 70) / 2).clamp(90, 160);
+        // The original MessageBox wraps text to the box width; measure with
+        // the real face (MS Sans Serif 11px) instead of estimating per
+        // character, and word-wrap long lines (Norme di utilizzo, the
+        // Progresso joke, ...) so they never overflow the window.
+        let mut face = crate::font::Face::new(crate::fonts::FONT_REGULAR, 1);
+        const MAX_W_PX: i32 = 320; // the old 160-DLU clamp
+        let mut lines: Vec<String> = Vec::new();
+        for para in text.split('\n') {
+            let mut cur = String::new();
+            for word in para.split(' ') {
+                let candidate = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+                if !cur.is_empty() && face.text_width(&candidate) > MAX_W_PX {
+                    lines.push(std::mem::take(&mut cur));
+                    cur = word.to_string();
+                } else {
+                    cur = candidate;
+                }
+            }
+            lines.push(cur);
+        }
+        let longest = lines.iter().map(|l| face.text_width(l)).max().unwrap_or(10);
+        let w = ((longest + 70) / 2).clamp(90, 160);
         let h = (lines.len() as i32 * 13 + 60) / 2 + 6;
 
         let leak = |s: &str| -> &'static str { Box::leak(s.to_string().into_boxed_str()) };
@@ -831,7 +918,7 @@ pub fn message_box(title: &str, text: &str, buttons: MsgBoxButtons) -> Frame {
                 id: -(i as i32) - 10,
                 kind: ControlKind::BorStatic,
                 class: "BorStatic",
-                text: leak(line),
+                text: leak(line.as_str()),
                 style: 0x4000_0000 | 0x1000_0000 | 0x0002_0000, // SS_LEFT(0)|WS_CHILD|WS_VISIBLE|WS_GROUP
                 x: 14,
                 y: 8 + i as i32 * 7,

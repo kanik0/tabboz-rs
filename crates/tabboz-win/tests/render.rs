@@ -5,7 +5,7 @@
 
 use tabboz_win::font::Fonts;
 use tabboz_win::pixel::Surface;
-use tabboz_win::render::{Frame, TabbozView, UiEvent};
+use tabboz_win::render::{Frame, TabbozView, UiEvent, message_box, MsgBoxButtons};
 use tabboz_win::theme::*;
 
 /// Renders the main dialog and returns (buffer, w, h, frame, fonts).
@@ -223,4 +223,56 @@ fn bold_face_falls_back_to_regular_for_missing_punctuation() {
     // box drew ~150.
     assert!(ink <= 30, "bold dots drew a notdef box: {ink} ink pixels");
     assert!(ink > 0, "bold dots drew nothing");
+}
+
+#[test]
+fn spegnimi_radios_check_like_the_original() {
+    // Dialog 16 (Spegnimi): BUTTON BS_AUTORADIOBUTTON controls must behave
+    // like radios: clicking 102 checks it and clears 101 (they render as
+    // plain push buttons without the BS_* style dispatch).
+    let mut frame = Frame::new(16);
+    let mut fonts = Fonts::new(1);
+    frame.check_radio(101); // WM_INITDIALOG default
+    // Radio 102: CONTROL "&Spegni il computer ed esci di casa", 26, 36.
+    let (x, y) = (2 + 26 * 2 + 8, 22 + 36 * 2 + 4);
+    frame.mouse_down(x, y, &mut fonts);
+    let ev = frame.mouse_up(x, y, &mut fonts);
+    assert_eq!(ev, Some(UiEvent::Button(102)));
+    assert!(frame.is_checked(102));
+    assert!(!frame.is_checked(101));
+}
+
+#[test]
+fn configuration_checkbox_click_toggles() {
+    // Dialog 14 (Configuration): BUTTON BS_AUTOCHECKBOX 107 (Enable Euro)
+    // at (6, 103) toggles its check and emits the click.
+    let mut frame = Frame::new(14);
+    let mut fonts = Fonts::new(1);
+    let (x, y) = (2 + 6 * 2 + 4, 22 + 103 * 2 + 4);
+    frame.mouse_down(x, y, &mut fonts);
+    let ev = frame.mouse_up(x, y, &mut fonts);
+    assert_eq!(ev, Some(UiEvent::Button(107)));
+    assert!(frame.is_checked(107));
+}
+
+#[test]
+fn message_box_wraps_long_lines_to_the_window() {
+    // A single very long paragraph must be word-wrapped into several
+    // lines inside the clamped box width, like the original MessageBox.
+    let frame = message_box(
+        "Norme di utilizzo",
+        "Il biglietto e' valido solo dopo la convalida. Il biglietto deve essere conservato per tutta la durata del viaggio. Il diritto a viaggiare cessa al termine della tratta corrispondente al valore del biglietto.",
+        MsgBoxButtons::Ok,
+    );
+    let (w, _h) = frame.window_size();
+    // Clamp: 160 DLU client + borders -> at most 332 px wide.
+    assert!(w <= 332, "box too wide: {w}");
+    // Wrapped into more than one text line.
+    let line_count = frame
+        .dlg()
+        .controls
+        .iter()
+        .filter(|c| c.kind == tabboz_win::dialogs::ControlKind::BorStatic && c.id < -9)
+        .count();
+    assert!(line_count >= 2, "text not wrapped: {line_count} lines");
 }
