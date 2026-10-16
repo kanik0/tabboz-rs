@@ -10,11 +10,11 @@ use tabboz_win::theme::*;
 #[ignore = "manual visual check"]
 fn dump_main_frame_ascii() {
     let mut frame = Frame::new(1);
-    let mut fonts = Fonts::new();
+    let mut fonts = Fonts::new(1);
     let (w, h) = frame.window_size();
     let mut buf = vec![0u32; (w * h) as usize];
     {
-        let mut s = Surface::new(&mut buf, w, h);
+        let mut s = Surface::new(&mut buf, w, h, 1);
         frame.render(&mut s, &mut fonts);
     }
 

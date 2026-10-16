@@ -11,11 +11,11 @@ use tabboz_win::theme::*;
 /// Renders the main dialog and returns (buffer, w, h, frame, fonts).
 fn render_main() -> (Vec<u32>, i32, i32, Frame, Fonts) {
     let mut frame = Frame::new(1);
-    let mut fonts = Fonts::new();
+    let mut fonts = Fonts::new(1);
     let (w, h) = frame.window_size();
     let mut buf = vec![0u32; (w * h) as usize];
     {
-        let mut s = Surface::new(&mut buf, w, h);
+        let mut s = Surface::new(&mut buf, w, h, 1);
         frame.render(&mut s, &mut fonts);
     }
     (buf, w, h, frame, fonts)
@@ -93,7 +93,7 @@ fn composed_tabboz_matches_original_layout() {
 #[test]
 fn dropdown_menu_opens_and_sends_commands() {
     let mut frame = Frame::new(1);
-    let mut fonts = Fonts::new();
+    let mut fonts = Fonts::new(1);
 
     // Press "&File" on the menubar, drag to "Chiudi...", release:
     // the classic Win95 menu gesture.
@@ -107,7 +107,7 @@ fn dropdown_menu_opens_and_sends_commands() {
 #[test]
 fn close_button_emits_close() {
     let mut frame = Frame::new(1);
-    let mut fonts = Fonts::new();
+    let mut fonts = Fonts::new(1);
     let (w, _) = frame.window_size();
     // The close button sits at (w-15, 4) 13x13.
     let (bx, by) = (w - 15, 4);
@@ -119,7 +119,7 @@ fn close_button_emits_close() {
 #[test]
 fn clicking_face_does_nothing() {
     let mut frame = Frame::new(1);
-    let mut fonts = Fonts::new();
+    let mut fonts = Fonts::new(1);
     // Empty face area inside the client region.
     let ev = frame.mouse_up(200, 200, &mut fonts);
     assert_eq!(ev, None);

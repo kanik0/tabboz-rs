@@ -43,6 +43,8 @@ struct App {
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Arc<Window>>>,
     fonts: Fonts,
+    /// Integer render scale (round of the window scale factor: 1 or 2).
+    scale: i32,
     main: Frame,
     snapshot: Option<MainSnapshot>,
     frames: Vec<OpenFrame>,
@@ -58,13 +60,14 @@ impl App {
         App {
             window: None,
             surface: None,
-            fonts: Fonts::new(),
+            fonts: Fonts::new(1),
             main: Frame::new(1), // MAIN
             snapshot: None,
             frames: Vec::new(),
             game_tx: None,
             proxy: Some(proxy),
             sound_tx: None,
+            scale: 1,
             mouse: (0.0, 0.0),
         }
     }
@@ -79,16 +82,20 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        let Some(window) = &self.window else { return };
+        let Some(_window) = &self.window else { return };
         let Some(surface) = &mut self.surface else { return };
 
+        // Physical-resolution rendering: the engine draws in logical
+        // coordinates, the Surface upscales every primitive by `scale`,
+        // so text is rasterized at 22px (crisp) on retina instead of
+        // being nearest-doubled from 11px.
         let (lw, lh) = self_size(&self.main);
-        let scale = window.scale_factor().round().max(1.0) as i32;
+        let scale = self.scale;
         let (pw, ph) = (lw * scale, lh * scale);
 
-        let mut logical = vec![0u32; (lw * lh) as usize];
+        let mut physical = vec![0u32; (pw * ph) as usize];
         {
-            let mut s = Surface::new(&mut logical, lw, lh);
+            let mut s = Surface::new(&mut physical, lw, lh, scale);
             self.main.render(&mut s, &mut self.fonts);
             for open in &mut self.frames {
                 open.frame.render(&mut s, &mut self.fonts);
@@ -98,12 +105,7 @@ impl App {
         if let (Some(pw_nz), Some(ph_nz)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) {
             surface.resize(pw_nz, ph_nz).expect("resize softbuffer surface");
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer");
-            for y in 0..ph {
-                let row = (y / scale * lw) as usize;
-                for x in 0..pw {
-                    buffer[(y * pw + x) as usize] = logical[row + (x / scale) as usize];
-                }
-            }
+            buffer.copy_from_slice(&physical);
             buffer.present().expect("present");
         }
     }
@@ -214,14 +216,29 @@ impl App {
 
     // ---- mouse routing ---------------------------------------------------
 
+    /// True when (lx, ly) is on the title bar but not on a caption button:
+    /// dragging the frameless window from there, like a native title bar.
+    fn title_bar_drag_hit(frame: &Frame, lx: i32, ly: i32) -> bool {
+        let (fw, _) = frame.window_size();
+        let in_bar = (tabboz_win::theme::BORDER..tabboz_win::theme::BORDER + tabboz_win::theme::TITLE_H)
+            .contains(&ly)
+            && (tabboz_win::theme::BORDER..fw - tabboz_win::theme::BORDER).contains(&lx);
+        if !in_bar {
+            return false;
+        }
+        // Caption buttons sit on the right edge; clicks there are clicks.
+        let buttons_w = if frame.dialog_style() & 0x0002_0000 != 0 {
+            13 * 2 + 3
+        } else {
+            13
+        };
+        lx < fw - tabboz_win::theme::BORDER - buttons_w
+    }
+
     fn handle_mouse(&mut self, event_loop: &ActiveEventLoop, action: MouseAction) {
-        let scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor().round().max(1.0))
-            .unwrap_or(1.0);
-        let (x, y) = (self.mouse.0 / scale, self.mouse.1 / scale);
-        let (lx, ly) = (x as i32, y as i32);
+        // Mouse coordinates are PHYSICAL pixels; the engine is logical.
+        let scale = self.scale as f64;
+        let (lx, ly) = ((self.mouse.0 / scale) as i32, (self.mouse.1 / scale) as i32);
 
         // Modals on top intercept everything.
         let Some(top) = self.frames.last_mut() else {
@@ -231,6 +248,13 @@ impl App {
                     self.main.mouse_move(lx, ly, &mut self.fonts);
                 }
                 MouseAction::Down => {
+                    // Drag the frameless window from its title bar.
+                    if Self::title_bar_drag_hit(&self.main, lx, ly) {
+                        if let Some(w) = &self.window {
+                            let _ = w.drag_window();
+                        }
+                        return;
+                    }
                     self.main.mouse_down(lx, ly, &mut self.fonts);
                 }
                 MouseAction::Up => {
@@ -256,7 +280,15 @@ impl App {
                 top.frame.mouse_move(lx, ly, &mut self.fonts);
             }
             MouseAction::Down => {
-                top.frame.mouse_down(lx, ly, &mut self.fonts);
+                // Drag modal frames from their title bar too.
+                if Self::title_bar_drag_hit(&top.frame, lx, ly) {
+                    let window = self.window.clone();
+                    if let Some(w) = &window {
+                        let _ = w.drag_window();
+                    }
+                } else {
+                    top.frame.mouse_down(lx, ly, &mut self.fonts);
+                }
             }
             MouseAction::Up => {
                 if let Some(ev) = top.frame.mouse_up(lx, ly, &mut self.fonts) {
@@ -374,6 +406,9 @@ impl ApplicationHandler<UiRequest> for App {
         let ctx: softbuffer::Context<winit::event_loop::OwnedDisplayHandle> =
             softbuffer::Context::new(event_loop.owned_display_handle()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface");
+        // Physical-resolution rendering needs the display scale.
+        self.scale = window.scale_factor().round().max(1.0) as i32;
+        self.fonts = Fonts::new(self.scale);
         self.window = Some(window);
         self.surface = Some(surface);
         self.redraw();
@@ -384,12 +419,6 @@ impl ApplicationHandler<UiRequest> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor().round().max(1.0))
-            .unwrap_or(1.0);
-
         match event {
             WindowEvent::CloseRequested => {
                 let _ = self.send_game(GameAction::Command { id: 108 });
@@ -408,9 +437,7 @@ impl ApplicationHandler<UiRequest> for App {
                 self.redraw();
             }
             WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
-                self.mouse = (self.mouse.0, self.mouse.1);
-                let (x, y) = (self.mouse.0 / scale, self.mouse.1 / scale);
-                self.mouse = (x, y);
+                // self.mouse stays in PHYSICAL pixels; handle_mouse converts.
                 match state {
                     winit::event::ElementState::Pressed => {
                         self.handle_mouse(event_loop, MouseAction::Down);
@@ -419,6 +446,19 @@ impl ApplicationHandler<UiRequest> for App {
                         self.handle_mouse(event_loop, MouseAction::Up);
                     }
                 }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // The window moved between displays: re-rasterize the fonts.
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor().round().max(1.0) as i32)
+                    .unwrap_or(1);
+                if scale != self.scale {
+                    self.scale = scale;
+                    self.fonts = Fonts::new(scale);
+                }
+                self.redraw();
             }
             WindowEvent::RedrawRequested => {
                 self.redraw();

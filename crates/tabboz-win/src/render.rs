@@ -217,6 +217,11 @@ impl Frame {
         self.dlg.id
     }
 
+    /// Raw dialog/window style bits (WS_MINIMIZEBOX etc.).
+    pub fn dialog_style(&self) -> u32 {
+        self.dlg.style
+    }
+
     /// Total window size in logical pixels, chrome included.
     pub fn window_size(&self) -> (i32, i32) {
         let menu = if self.dlg.menu.is_some() { MENU_H } else { 0 };
