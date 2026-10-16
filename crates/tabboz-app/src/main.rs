@@ -48,6 +48,8 @@ struct App {
     fonts: Fonts,
     /// Integer render scale (round of the window scale factor: 1 or 2).
     scale: i32,
+    /// Where the main window is drawn inside the (dynamic) window content.
+    main_offset: (i32, i32),
     main: Frame,
     snapshot: Option<MainSnapshot>,
     frames: Vec<OpenFrame>,
@@ -71,28 +73,63 @@ impl App {
             proxy: Some(proxy),
             sound_tx: None,
             scale: 1,
+            main_offset: (0, 0),
             mouse: (0.0, 0.0),
         }
     }
 
     // ---- rendering -------------------------------------------------------
 
-    /// Offset that centers a frame over the main window.
-    fn center_offset(&self, frame: &Frame) -> (i32, i32) {
+    /// Window logical size: the main window, grown to fit the largest open
+    /// frame (dialogs like Scuola are 530px wide, wider than the 412px
+    /// main; in the original each dialog was a separate OS window).
+    /// Every window gets a margin like a real desktop.
+    const MARGIN: i32 = 12;
+
+    fn content_size(&self) -> (i32, i32) {
+        let (mut w, mut h) = self_size(&self.main);
+        for open in &self.frames {
+            let (fw, fh) = open.frame.window_size();
+            w = w.max(fw);
+            h = h.max(fh);
+        }
+        (w + 2 * Self::MARGIN, h + 2 * Self::MARGIN)
+    }
+
+    /// Recomputes the window size and the offset of every frame (centered
+    /// in the window); render and mouse routing share these offsets, so a
+    /// click always lands where the frame is actually drawn.
+    fn layout(&mut self) -> (i32, i32) {
+        let (w, h) = self.content_size();
         let (mw, mh) = self_size(&self.main);
-        let (fw, fh) = frame.window_size();
-        (((mw - fw) / 2).max(0), ((mh - fh) / 2).max(0))
+        self.main_offset = (
+            (w - mw) / 2,
+            if self.frames.iter().any(|f| f.hides_main) { 0 } else { (h - mh) / 2 },
+        );
+        self.main.set_offset(self.main_offset.0, self.main_offset.1);
+        for open in &mut self.frames {
+            let (fw, fh) = open.frame.window_size();
+            let off = ((w - fw) / 2, (h - fh) / 2);
+            open.frame.set_offset(off.0, off.1);
+        }
+        (w, h)
     }
 
     fn redraw(&mut self) {
-        let Some(_window) = &self.window else { return };
+        // Dynamic layout: resize the window when the open frames need more
+        // room, then center everything (render + hit testing share the
+        // same offsets). Runs first, before any borrow of self is live.
+        let (lw, lh) = self.layout();
+        if let Some(window) = &self.window {
+            let want = winit::dpi::LogicalSize::new(lw as f64, lh as f64);
+            let cur = window.inner_size().to_logical::<f64>(window.scale_factor());
+            if (cur.width.round() as i32, cur.height.round() as i32) != (lw, lh) {
+                let _ = window.request_inner_size(want);
+            }
+        }
+
         let Some(surface) = &mut self.surface else { return };
 
-        // Physical-resolution rendering: the engine draws in logical
-        // coordinates, the Surface upscales every primitive by `scale`,
-        // so text is rasterized at 22px (crisp) on retina instead of
-        // being nearest-doubled from 11px.
-        let (lw, lh) = self_size(&self.main);
         let scale = self.scale;
         let (pw, ph) = (lw * scale, lh * scale);
 
@@ -136,8 +173,7 @@ impl App {
                 for id in checks {
                     frame.check(id, true);
                 }
-                let (ox, oy) = self.center_offset(&frame);
-                frame.set_offset(ox, oy);
+                // layout() in redraw() centers the frame in the window.
                 // Game dialogs hide the main window (ShowWindow(WIN_PICCOLO));
                 // about/personal info/config/logo/spegnimi keep it visible.
                 self.frames.push(OpenFrame {
@@ -179,7 +215,7 @@ impl App {
                 event_loop.exit();
             }
             UiRequest::Ask { kind, reply } => {
-                let mut frame = match &kind {
+                let frame = match &kind {
                     AskKind::Message { title, text } => {
                         message_box(title, text, MsgBoxButtons::Ok)
                     }
@@ -195,8 +231,6 @@ impl App {
                     }
                 };
                 let yes_no = matches!(kind, AskKind::Confirm { .. });
-                let (ox, oy) = self.center_offset(&frame);
-                frame.set_offset(ox, oy);
                 // Message boxes and event dialogs inherit the current mode:
                 // over the main window it stays visible, over a game dialog
                 // the teal desktop stays.
@@ -264,7 +298,9 @@ impl App {
 
         // Modals on top intercept everything.
         let Some(top) = self.frames.last_mut() else {
-            // No modal: route to the main window.
+            // No modal: route to the main window (at its layout offset).
+            let (ox, oy) = self.main_offset;
+            let (lx, ly) = (lx - ox, ly - oy);
             match action {
                 MouseAction::Move => {
                     self.main.mouse_move(lx, ly, &mut self.fonts);
@@ -289,10 +325,9 @@ impl App {
             return;
         };
 
-        // Coordinates local to the modal frame (it is centered on the main).
-        let (mw, mh) = self_size(&self.main);
-        let (fw, fh) = top.frame.window_size();
-        let (fx, fy) = (((mw - fw) / 2).max(0), ((mh - fh) / 2).max(0));
+        // Local coordinates of the top frame: the offset is the one the
+        // layout computed (the same used by the renderer).
+        let (fx, fy) = top.frame.offset();
         let (lx, ly) = (lx - fx, ly - fy);
 
         let is_ask = top.ask.is_some();
@@ -424,7 +459,9 @@ impl ApplicationHandler<UiRequest> for App {
         self.game_tx = Some(game_tx);
         self.sound_tx = Some(sound_tx);
 
-        let (lw, lh) = self_size(&self.main);
+        // Start at the main window size + margin; layout() grows it when
+        // wider dialogs open.
+        let (lw, lh) = (self_size(&self.main).0 + 2 * Self::MARGIN, self_size(&self.main).1 + 2 * Self::MARGIN);
         let attrs = Window::default_attributes()
             .with_title("Tabboz Simulator")
             .with_inner_size(winit::dpi::LogicalSize::new(lw as f64, lh as f64))

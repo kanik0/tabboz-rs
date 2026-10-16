@@ -202,6 +202,11 @@ impl Frame {
         self.state.offset = (x, y);
     }
 
+    /// Render offset of this frame (where it is drawn in the window).
+    pub fn offset(&self) -> (i32, i32) {
+        self.state.offset
+    }
+
     /// Selects the tipa bitmap of BMPTipa (current_tipa + 1204).
     pub fn set_tipa_image(&mut self, n: i32) {
         self.state.tipa_img = n;
