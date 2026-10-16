@@ -14,7 +14,7 @@ use tabboz_core::money::mostra_soldi;
 use tabboz_core::state::{GameState, MATERIE};
 use tabboz_core::{Interact, Rng};
 
-use crate::ui::{GameAction, MainSnapshot, TabbozSnapshot, UiBridge, UiRequest};
+use crate::ui::{AskKind, DialogAnswer, GameAction, MainSnapshot, TabbozSnapshot, UiBridge, UiRequest};
 
 /// Shop item tables (vestiti.c STSCOOTER reuse: speed/mass/xxx/fama/...).
 /// Only cc (fama min for disco), fama, prezzo are meaningful here:
@@ -73,17 +73,6 @@ const DISCO_MEM: [Disco; 9] = [
 /// PalestraMem of vestiti.c: prezzi abbonamenti (mese, sei mesi, anno, lampada).
 const PALESTRA_MEM: [i64; 4] = [50, 270, 500, 14];
 
-/// ScooterMem of scooter.c (for compagnia "gareggia"): speed and name.
-const SCOOTER_MEM: [(i32, &str); 8] = [
-    (0, "Nessuno scooter"),
-    (65, "Magutty Firecow"),
-    (75, "Honda F98"),
-    (105, "Mizzubisci R200 Millenium"),
-    (75, "Magutty Firecow+"),
-    (100, "Magutty Firecow II"),
-    (100, "Honda F98s"),
-    (250, "Lexux LS400"),
-];
 
 const N_ATTIVITA: [&str; 7] = [
     "mancante",
@@ -111,6 +100,25 @@ enum Handler {
     PersonalInfo,
     Logo,
     Spegnimi,
+    Scooter,
+    Concessionario,
+    Showroom,
+    VendiScooter,
+    RiparaScooter,
+    TruccaScooter,
+    Pezzi,
+    Lavoro,
+    Interview,
+    Quiz,
+    InfoDitta,
+    Tipa,
+    CercaTipa,
+    DueDiPicche,
+    Cellular,
+    CompraCellular,
+    AbbonaCellular,
+    Configuration,
+    Format,
 }
 
 pub struct Game {
@@ -127,6 +135,33 @@ pub struct Game {
     selezione: usize,
     /// Spegnimi choice.
     shutdown: i32,
+
+    // ---- scooter / lavoro / tipa / cellulare scratch state (the original
+    // uses static locals; they live here per session) ----
+    /// Showroom selection (ScooterMem index), 0 = none.
+    scooter_scelta: usize,
+    /// The showroom dialog closed with OK (buy) instead of Cancel.
+    acquista_ok: bool,
+    /// Vendi: offerta in migliaia di lire (static long offerta).
+    sell_offerta: i64,
+    /// Ripara: costo riparazione (static long costo).
+    repair_costo: i64,
+    /// Lavoro: ditta dell'intervista in corso (1..=8).
+    interview_ditta: usize,
+    /// Lavoro: l'intervista e' stata accettata (accetto == IDYES).
+    interview_accettata: bool,
+    /// Quiz: checkbox 101..=109 (Risposte1/2/3).
+    risposte: [bool; 9],
+    /// Cerca tipa: nome e figosita' della tipa in esame (nomeTemp/figTemp).
+    nome_temp: String,
+    fig_temp: i32,
+    /// Due di picche: contatore click sul bottone 201.
+    ddp_clicks: i32,
+    /// Compra cellulare / abbonamento: radio selection.
+    cellular_scelta: usize,
+    abbonamento_scelta: usize,
+    /// Format (reset): sesso scelto nel dialog 15.
+    format_sesso: char,
 }
 
 impl Game {
@@ -141,6 +176,19 @@ impl Game {
             scelta: 1,
             selezione: 0,
             shutdown: 1,
+            scooter_scelta: 0,
+            acquista_ok: false,
+            sell_offerta: 0,
+            repair_costo: 0,
+            interview_ditta: 0,
+            interview_accettata: false,
+            risposte: [false; 9],
+            nome_temp: String::new(),
+            fig_temp: 0,
+            ddp_clicks: 0,
+            cellular_scelta: 0,
+            abbonamento_scelta: 0,
+            format_sesso: 'M',
         }
     }
 
@@ -149,7 +197,7 @@ impl Game {
         self.update_main();
         while let Ok(action) = self.rx.recv() {
             match action {
-                GameAction::Button { token, id } => self.on_button(token, id),
+                GameAction::Button { token, id, x, y } => self.on_button(token, id, x, y),
                 GameAction::Command { id } => self.on_menu(id),
                 GameAction::FrameClosed { token } => self.on_closed(token),
             }
@@ -177,8 +225,166 @@ impl Game {
     }
 
     fn close(&mut self, token: u64) {
+        let handler = self.handler_of(token);
         self.frames.retain(|(t, _)| *t != token);
         let _ = self.bridge.tx.send_event(UiRequest::CloseFrame { token });
+        // Post-close continuations: the code the original runs right after
+        // DialogBox() returns (buy the scooter, evaluate the quiz, ...).
+        if let Some(handler) = handler {
+            self.continuation(handler);
+        }
+    }
+
+    fn continuation(&mut self, handler: Handler) {
+        match handler {
+            Handler::Showroom => {
+                // Concessionario case 101/102 after the showroom closes.
+                if self.acquista_ok && self.scooter_scelta != 0 {
+                    let scelta = self.scooter_scelta;
+                    if self.state.scooter.stato != -1 {
+                        self.message(
+                            "Incentivi",
+                            &format!(
+                                "Per il tuo vecchio scooter da rottamare ti diamo {} di supervalutazione...",
+                                mostra_soldi(1000, self.state.euro)
+                            ),
+                        );
+                        self.state.soldi += 1000;
+                        self.state.scooter = tabboz_core::state::Scooter::none();
+                        self.state.benzina = 0;
+                    }
+                    let prezzo = SCOOTER_MEM_FULL[scelta].5 as u64;
+                    if prezzo > self.state.soldi {
+                        self.message(
+                            "Non hai abbastanza soldi",
+                            "Ti piacerebbe comprare lo scooter, vero ?\nPurtroppo, non hai abbastanza soldi...",
+                        );
+                        if self.state.reputazione > 3 {
+                            self.state.reputazione -= 1;
+                        }
+                    } else {
+                        self.state.soldi -= prezzo;
+                        self.state.scooter = tabboz_core::state::Scooter {
+                            speed: SCOOTER_MEM_FULL[scelta].0,
+                            marmitta: SCOOTER_MEM_FULL[scelta].1,
+                            carburatore: SCOOTER_MEM_FULL[scelta].2,
+                            cc: SCOOTER_MEM_FULL[scelta].3,
+                            filtro: SCOOTER_MEM_FULL[scelta].4,
+                            prezzo: SCOOTER_MEM_FULL[scelta].5,
+                            attivita: 1,
+                            stato: 100,
+                            nome: SCOOTER_MEM_FULL[scelta].6.to_string(),
+                            fama: SCOOTER_MEM_FULL[scelta].7,
+                        };
+                        self.state.benzina = 20;
+                        self.message(
+                            "Lo scooter nuovo",
+                            "Fai un giro del quartiere per farti vedere con lo scooter nuovo...",
+                        );
+                        self.state.reputazione += 4;
+                        if self.state.reputazione > 100 {
+                            self.state.reputazione = 100;
+                        }
+                    }
+                    self.evento();
+                }
+                if let Some(t) = self.frame_of(Handler::Concessionario) {
+                    let soldi = mostra_soldi(self.state.soldi, self.state.euro);
+                    self.set_text(t, 104, soldi);
+                }
+            }
+            Handler::Concessionario => {
+                // Scooter case 101 after the concessionario closes.
+                self.evento();
+                if let Some(t) = self.frame_of(Handler::Scooter) {
+                    self.refresh_scooter_frame(t);
+                }
+            }
+            Handler::Interview => {
+                // Lavoro case 110 after the interview dialog closes.
+                if self.interview_accettata {
+                    self.risposte = [false; 9];
+                    let scheda = self.rng.random(9);
+                    self.open(Handler::Quiz, 200 + scheda as u32, vec![], vec![]);
+                } else {
+                    self.message("Cerca Lavoro", "Allora sparisci...");
+                }
+            }
+            Handler::Quiz => {
+                // Lavoro case 110 after the quiz closes: the answers are
+                // checked with the weights of the original (1/10/100).
+                let mut rcheck = 0i32;
+                for (i, on) in self.risposte.iter().enumerate() {
+                    if *on {
+                        rcheck += match i / 3 {
+                            0 => 1,
+                            1 => 10,
+                            _ => 100,
+                        };
+                    }
+                }
+                if rcheck != 111 {
+                    if self.state.sesso == 'M' {
+                        self.message("Sei un po' stupido...", "Mi spieghi perche' dovremmo assumere qualcuno che non e' neanche in grado di mettere delle crocette su un foglio ???");
+                    } else {
+                        self.message("Sei un po' stupida...", "Signorina,mi spieghi perche' dovremmo assumere qualcuno che non e' neanche in grado di mettere delle crocette su un foglio ???");
+                    }
+                } else if (self.state.reputazione + self.state.fortuna + self.rng.random(80))
+                    > self.rng.random(200)
+                {
+                    let n_ditta = self.interview_ditta;
+                    self.state.impegno = 10 + self.rng.random(20);
+                    self.state.giorni_di_lavoro = 1;
+                    self.state.stipendio = 1000 + (self.rng.random(10) as i64) * 100;
+                    self.state.numeroditta = n_ditta as i32;
+                    let nome = LAVORO_MEM[n_ditta];
+                    if self.state.sesso == 'M' {
+                        self.message(
+                            "Hai trovato lavoro !",
+                            &format!("SEI STATO ASSUNTO ! Ora sei un felice dipendente della {nome} !"),
+                        );
+                    } else {
+                        self.message(
+                            "Hai trovato lavoro !",
+                            &format!("SEI STATA ASSUNTA ! Ora sei una felice dipendente della {nome} !"),
+                        );
+                    }
+                } else {
+                    if self.state.sesso == 'M' {
+                        self.message("Cerca Lavoro", "Mi dispiace ragazzo, ma non sei riuscito a superare il test... Ora puoi anche portare la tua brutta faccia fuori dal mio ufficio, prima che ti faccia buttare fuori a calci... Grazie e arrivederci...");
+                    } else {
+                        self.message("Cerca Lavoro", "Mi dispiace signorina, ma non e' riuscito a superare il test... Se ne vada immediatamente, grazie...");
+                    }
+                    if self.state.reputazione > 10 {
+                        self.state.reputazione -= 2;
+                    }
+                }
+                self.evento();
+                if let Some(t) = self.frame_of(Handler::Lavoro) {
+                    self.refresh_lavoro_frame(t);
+                }
+            }
+            Handler::Format => {
+                // Configuration case 203 -> FormatTabboz OK: ResetMe(0).
+                let sesso = self.format_sesso;
+                self.state = tabboz_core::GameState::reset(false, &mut self.rng);
+                self.state.sesso = sesso;
+                if sesso == 'M' {
+                    self.state.nome = "Tizio".into();
+                    self.state.cognome = "Caio".into();
+                } else {
+                    self.state.nome = "Nessuna".into();
+                    self.state.cognome = "In Particolare".into();
+                }
+                self.update_main();
+            }
+            _ => {}
+        }
+    }
+
+    /// Token of the last opened frame driven by this handler.
+    fn frame_of(&self, handler: Handler) -> Option<u64> {
+        self.frames.iter().rev().find(|(_, h)| *h == handler).map(|(t, _)| *t)
     }
 
     fn set_text(&mut self, token: u64, id: i32, text: String) {
@@ -302,20 +508,13 @@ impl Game {
         }
     }
 
-    fn not_ported(&mut self, what: &str) {
-        self.message(
-            "Tabboz Simulator",
-            &format!("\"{what}\" non e' ancora stato portato: arrivera' nella prossima milestone."),
-        );
-    }
-
     // ---- event routing ----------------------------------------------------
 
     fn handler_of(&self, token: u64) -> Option<Handler> {
         self.frames.iter().find(|(t, _)| *t == token).map(|(_, h)| *h)
     }
 
-    fn on_button(&mut self, token: u64, id: i32) {
+    fn on_button(&mut self, token: u64, id: i32, x: i32, y: i32) {
         // OK/Cancel are handled per-dialog (the original switches on wParam
         // inside each dialog procedure; e.g. Disco's OK pays, About's OK
         // closes), so there is no global close here.
@@ -333,6 +532,25 @@ impl Game {
             Some(Handler::PersonalInfo) => self.close(token),
             Some(Handler::Logo) => self.close(token),
             Some(Handler::Spegnimi) => self.on_spegnimi(token, id),
+            Some(Handler::Scooter) => self.on_scooter(token, id),
+            Some(Handler::Concessionario) => self.on_concessionario(token, id),
+            Some(Handler::Showroom) => self.on_showroom(token, id),
+            Some(Handler::VendiScooter) => self.on_vendi_scooter(token, id),
+            Some(Handler::RiparaScooter) => self.on_ripara_scooter(token, id),
+            Some(Handler::TruccaScooter) => self.on_trucca_scooter(token, id),
+            Some(Handler::Pezzi) => self.on_pezzi(token, id),
+            Some(Handler::Lavoro) => self.on_lavoro(token, id),
+            Some(Handler::Interview) => self.on_interview(token, id),
+            Some(Handler::Quiz) => self.on_quiz(token, id),
+            Some(Handler::InfoDitta) => self.close(token),
+            Some(Handler::Tipa) => self.on_tipa(token, id, x, y),
+            Some(Handler::CercaTipa) => self.on_cerca_tipa(token, id),
+            Some(Handler::DueDiPicche) => self.on_due_di_picche(token, id),
+            Some(Handler::Cellular) => self.on_cellular(token, id),
+            Some(Handler::CompraCellular) => self.on_compra_cellular(token, id),
+            Some(Handler::AbbonaCellular) => self.on_abbona_cellulare(token, id),
+            Some(Handler::Configuration) => self.on_configuration(token, id),
+            Some(Handler::Format) => self.on_format(token, id),
             _ => {}
         }
     }
@@ -369,19 +587,19 @@ impl Game {
             108 => self.open_spegnimi(),
             120 => self.open_about(),
             121 => self.open(Handler::Logo, 12, vec![], vec![]),
-            130 => self.not_ported("Scooter"),
+            130 => self.open_scooter(),
             132 => self.open_disco(),
-            133 => self.not_ported("Tipa"),
+            133 => self.open_tipa(),
             134 => self.open_compagnia(),
             135 => self.open_famiglia(),
             136 => self.on_main_button(136),
-            137 => self.not_ported("Lavoro"),
+            137 => self.open_lavoro(),
             139 => self.open_personalinfo(),
-            140 => self.not_ported("Configuration"),
+            140 => self.open_configuration(),
             141 => self.run_tabacchi(),
             142 => self.run_palestra(),
             143..=147 => self.run_vestiti(id),
-            155 => self.not_ported("Telefonino"),
+            155 => self.open_cellular(),
             _ => {}
         }
     }
@@ -390,10 +608,10 @@ impl Game {
         match id {
             103 => self.open_personalinfo(), // BMPView click
             120 => self.open_about(),
-            130 => self.not_ported("Scooter"),
+            130 => self.open_scooter(),
             131 => self.open_negozi(),
             132 => self.open_disco(),
-            133 => self.not_ported("Tipa"),
+            133 => self.open_tipa(),
             134 => self.open_compagnia(),
             135 => self.open_famiglia(),
             136 => {
@@ -406,7 +624,7 @@ impl Game {
                     );
                 }
             }
-            137 => self.not_ported("Lavoro"),
+            137 => self.open_lavoro(),
             _ => {}
         }
     }
@@ -791,7 +1009,7 @@ impl Game {
                 let soldi = mostra_soldi(self.state.soldi, self.state.euro);
                 self.set_text(token, 120, soldi);
             }
-            112 => self.not_ported("Telefonino"),
+            112 => self.open_cellular(),
             _ => self.close(token),
         }
     }
@@ -1163,7 +1381,7 @@ impl Game {
                 }
                 self.bridge.play_sound(701);
                 let i = (1 + self.rng.random(6)) as usize;
-                let nome = SCOOTER_MEM[i].1;
+                let nome = SCOOTER_MEM_FULL[i].6;
                 let yes = self.confirm(
                     "Gareggia con lo scooter",
                     &format!("Accetti la sfida con un tabbozzo che ha un {nome} ?"),
@@ -1172,7 +1390,7 @@ impl Game {
                     self.state.scooter.stato -= self.rng.random(2);
                 }
                 if yes {
-                    let rival = SCOOTER_MEM[i].0 + 80 + self.rng.random(40);
+                    let rival = SCOOTER_MEM_FULL[i].0 + 80 + self.rng.random(40);
                     let mio =
                         self.state.scooter.speed + self.state.scooter.stato + self.state.fortuna;
                     if rival > mio {
@@ -1340,3 +1558,1299 @@ impl Game {
     }
 }
 
+
+// ===========================================================================
+// M6: scooter, lavoro, tipa, telefonino, configuration (faithful ports of
+// scooter.c, lavoro.c, tipa.c, telefono.c and the Configuration handler).
+// ===========================================================================
+
+/// ScooterMem of scooter.c: (speed, marmitta, carburatore, cc, filtro,
+/// prezzo, nome, fama). Index 0 = nessuno scooter.
+#[allow(clippy::type_complexity)] // the 1:1 shape of NEWSTSCOOTER
+const SCOOTER_MEM_FULL: [(i32, i32, i32, i32, i32, i64, &str, i32); 8] = [
+    (0, 0, 0, 0, 0, 0, "Nessuno scooter", 0),
+    (65, 0, 0, 0, 0, 2498, "Magutty Firecow", 5),
+    (75, 0, 1, 1, 1, 4348, "Honda F98", 10),
+    (105, 1, 1, 2, 1, 6498, "Mizzubisci R200 Millenium", 15),
+    (75, 0, 0, 1, 1, 4298, "Magutty Firecow+", 7),
+    (100, 0, 1, 2, 1, 5998, "Magutty Firecow II", 10),
+    (100, 0, 1, 2, 1, 6348, "Honda F98s", 13),
+    (250, 0, 5, 5, 0, 1450, "Lexux LS400 ", 60),
+];
+
+/// PezziMem: prices of the tuning parts (marmitte, carburatori, cc, filtri).
+const PEZZI_MEM: [i64; 15] = [
+    400, 500, 600, // marmitte
+    300, 470, 650, 800, // carburatori
+    200, 400, 800, 1000, // cc
+    50, 120, 270, 400, // filtri
+];
+
+/// tabella[] of scooter.c: speed by cc + carburatore*6.
+const TABELLA: [i32; 36] = [
+    65, 70, -100, -100, -100, -100, //
+    70, 80, 95, -100, -100, -100, //
+    -1000, 90, 100, 115, -100, -100, //
+    -1000, -1000, 110, 125, 135, -100, //
+    -1000, -1000, -1000, 130, 150, -100, //
+    -1000, -1000, -1000, -1000, -1000, 250,
+];
+
+const N_MARMITTA: [&str; 4] = ["standard", "silenziosa", "rumorosa", "rumorosissima"];
+const N_CARBURATORE: [&str; 6] = ["12/10", "16/16", "19/19", "20/20", "24/24", "custom"];
+const N_CC: [&str; 6] = ["50cc", "70cc", "90cc", "120cc", "150cc", "3969cc"];
+const N_FILTRO: [&str; 5] = ["standard", "P1", "P2", "P2+", "Extreme"];
+
+/// LavoroMem of lavoro.c (nome only; speed = fuori porta).
+/// (never checked in the original either, kept for fidelity)
+#[allow(dead_code)]
+const LAVORO_MEM_FUORI_PORTA: [bool; 9] = [false, false, false, true, false, true, true, true, true];
+const LAVORO_MEM: [&str; 9] = [
+    "---",
+    "Magneti Budelli",
+    "Diamine",
+    "Testmec",
+    "Ti Impalo Bene Bene",
+    "October",
+    "Arlond's",
+    "286 - Computer d' annata",
+    "Ricopio",
+];
+
+/// CellularMem of telefono.c: (dual, fama, stato, prezzo, nome).
+const CELLULAR_MEM: [(i32, i32, i32, i64, &str); 3] = [
+    (0, 2, 100, 290, "Motorolo d170"),
+    (0, 7, 100, 590, "Motorolo 8700"),
+    (1, 10, 100, 990, "Macro TAC 8900"),
+];
+
+/// AbbonamentMem of telefono.c: (abbonamento, dualonly, creditorest, fama,
+/// prezzo, nome).
+const ABBONAMENT_MEM: [(i32, i32, i32, i32, i64, &str); 9] = [
+    (1, 0, 50, 1, 100, "Onmitel"), // Abbonamenti
+    (1, 0, 50, 1, 100, "DIM"),
+    (1, 1, 100, 1, 100, "Vind"),
+    (0, 0, 50, 1, 60, "Onmitel"), // Ricariche
+    (0, 0, 100, 1, 110, "Onmitel"),
+    (0, 0, 50, 1, 60, "DIM"),
+    (0, 0, 100, 1, 110, "DIM"),
+    (0, 1, 50, 1, 50, "Vind"),
+    (0, 1, 100, 1, 100, "Vind"),
+];
+
+impl Game {
+    // ---- scooter ----------------------------------------------------------
+
+    /// CalcolaVelocita of scooter.c (preview skips the state checks, like
+    /// the original's showscooter flag).
+    fn calcola_velocita(&mut self, preview: bool) {
+        let s = &mut self.state.scooter;
+        s.speed = (s.marmitta * 5) + (s.filtro * 5) + TABELLA[(s.cc + s.carburatore * 6) as usize];
+        s.attivita = 1;
+        if preview {
+            return;
+        }
+        if s.speed <= -500 {
+            s.attivita = 3; // invasato
+        } else if s.speed <= -1 {
+            s.attivita = 2; // ingrippato
+        }
+        if self.state.benzina < 1 {
+            s.attivita = 6; // a secco
+        }
+        if s.attivita != 1 {
+            let att = N_ATTIVITA[s.attivita as usize];
+            let msg = format!("Il tuo scooter e' {att}.");
+            self.message("Attenzione", &msg);
+        }
+    }
+
+    /// AggiornaScooter of scooter.c.
+    fn scooter_texts(&mut self) -> Vec<(i32, String)> {
+        let mut texts = vec![(104, mostra_soldi(self.state.soldi, self.state.euro))];
+        let s = &self.state.scooter;
+        if s.stato != -1 {
+            texts.push((107, format!("{}.{}l", self.state.benzina / 10, self.state.benzina % 10)));
+            texts.push((110, self.mostra_speed()));
+            texts.push((111, N_MARMITTA[s.marmitta as usize].to_string()));
+            texts.push((112, N_CARBURATORE[s.carburatore as usize].to_string()));
+            texts.push((113, N_CC[s.cc as usize].to_string()));
+            texts.push((114, N_FILTRO[s.filtro as usize].to_string()));
+            texts.push((115, format!("{}%", s.stato)));
+            texts.push((116, s.nome.clone()));
+            texts.push((117, mostra_soldi(s.prezzo as u64, self.state.euro)));
+        } else {
+            for id in [107, 110, 111, 112, 113, 114, 115, 116, 117] {
+                texts.push((id, String::new()));
+            }
+        }
+        texts
+    }
+
+    /// MostraSpeed of scooter.c.
+    fn mostra_speed(&self) -> String {
+        let s = &self.state.scooter;
+        match s.attivita {
+            1 => format!("{}Km/h", s.speed),
+            2..=6 => format!("({})", N_ATTIVITA[s.attivita as usize]),
+            _ => String::new(),
+        }
+    }
+
+    fn refresh_scooter_frame(&mut self, token: u64) {
+        for (cid, text) in self.scooter_texts() {
+            self.set_text(token, cid, text);
+        }
+    }
+
+    fn open_scooter(&mut self) {
+        let mut texts = self.scooter_texts();
+        let mut park_label = "Parcheggia scooter".to_string();
+        if self.state.scooter.attivita == 4 {
+            park_label = "Usa scooter".to_string();
+        }
+        texts.push((105, park_label));
+        self.open(Handler::Scooter, 7, texts, vec![]);
+    }
+
+    fn on_scooter(&mut self, token: u64, id: i32) {
+        let ao = self.state.ao();
+        match id {
+            101 => {
+                // Acquista -> concessionario
+                if self.state.vacanza == 2 {
+                    self.message("Concessionario", &format!("Oh, tip{ao}... oggi il concessionario e' chiuso..."));
+                    return;
+                }
+                let texts = vec![(104, mostra_soldi(self.state.soldi, self.state.euro))];
+                self.open(Handler::Concessionario, 70, texts, vec![]);
+            }
+            102 => {
+                // Trucca
+                if self.state.scooter.stato != -1 {
+                    if self.state.vacanza != 2 {
+                        if self.state.sound_active {
+                            self.bridge.play_sound(101);
+                        }
+                        let texts = self.scooter_texts();
+                        self.open(Handler::TruccaScooter, 73, texts, vec![]);
+                        return;
+                    }
+                    self.message("Trucca lo scooter", &format!("Oh, tip{ao}... oggi il meccanico e' chiuso..."));
+                } else {
+                    self.message(
+                        "Trucca lo scooter",
+                        "Scusa, ma quale scooter avresti intenzione di truccare visto che non ne hai neanche uno ???",
+                    );
+                }
+                let mut park = "Parcheggia scooter".to_string();
+                if self.state.scooter.attivita == 4 {
+                    park = "Usa scooter".to_string();
+                }
+                self.set_text(token, 105, park);
+                self.evento();
+            }
+            103 => {
+                // Ripara
+                if self.state.scooter.stato == -1 {
+                    self.message(
+                        "Ripara lo scooter",
+                        "Mi spieghi come fai a farti riparare lo scooter se non lo hai ???",
+                    );
+                } else if self.state.scooter.stato == 100 {
+                    self.message(
+                        "Ripara lo scooter",
+                        "Che motivi hai per voleer riparare il tuo scooter\nvisto che e' al 100% di efficienza ???",
+                    );
+                } else if self.state.vacanza == 2 {
+                    self.message("Ripara lo scooter", &format!("Oh, tip{ao}... oggi il meccanico e' chiuso..."));
+                } else {
+                    let costo = (self.state.scooter.prezzo / 100 * (100 - self.state.scooter.stato as i64)) + 10;
+                    self.repair_costo = costo;
+                    let texts = vec![
+                        (104, mostra_soldi(self.state.soldi, self.state.euro)),
+                        (105, mostra_soldi(costo as u64, self.state.euro)),
+                    ];
+                    self.open(Handler::RiparaScooter, 72, texts, vec![]);
+                }
+            }
+            105 => {
+                // Parcheggia / Usa scooter
+                if self.state.scooter.stato < 0 {
+                    self.message(
+                        "Parcheggia lo scooter",
+                        "Mi spieghi come fai a parcheggiare lo scooter se non lo hai ???",
+                    );
+                    return;
+                }
+                match self.state.scooter.attivita {
+                    1 => {
+                        self.state.scooter.attivita = 4;
+                        self.set_text(token, 105, "Usa scooter".to_string());
+                    }
+                    4 => {
+                        self.state.scooter.attivita = 1;
+                        self.set_text(token, 105, "Parcheggia scooter".to_string());
+                    }
+                    a => {
+                        let msg = format!(
+                            "Mi spieghi come fai a parcheggiare lo scooter visto che e' {} ???",
+                            N_ATTIVITA[a as usize]
+                        );
+                        self.message("Parcheggia lo scooter", &msg);
+                    }
+                }
+                self.refresh_scooter_frame(token);
+            }
+            106 => {
+                // Fai benzina
+                if self.state.scooter.stato < 0 {
+                    self.message("Fai benza", "Mi spieghi come fai a far benzina allo scooter se non lo hai ???");
+                    return;
+                }
+                match self.state.scooter.attivita {
+                    1 | 2 | 3 | 6 => {
+                        if self.state.soldi < 10 {
+                            let msg = format!(
+                                "Al distributore automatico puoi fare un minimo di {} di benzina...",
+                                mostra_soldi(10, self.state.euro)
+                            );
+                            self.message("Fai benza", &msg);
+                        } else {
+                            self.state.soldi -= 10;
+                            self.state.benzina = 50; // 5 litri
+                            if self.state.scooter.cc == 5 {
+                                self.state.benzina = 850; // la macchinina figa
+                            }
+                            self.calcola_velocita(false);
+                            let msg = format!(
+                                "Fai {} di benzina e riempi lo scooter...",
+                                mostra_soldi(10, self.state.euro)
+                            );
+                            self.message("Fai benza", &msg);
+                        }
+                    }
+                    a => {
+                        let msg = format!(
+                            "Mi spieghi come fai a far benzina allo scooter visto che e' {} ???",
+                            N_ATTIVITA[a as usize]
+                        );
+                        self.message("Fai benza", &msg);
+                    }
+                }
+                self.refresh_scooter_frame(token);
+                self.evento();
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_concessionario(&mut self, token: u64, id: i32) {
+        match id {
+            101 | 102 => {
+                // Malagutty (78) / altre marche (79)
+                let dlg = if id == 101 { 78 } else { 79 };
+                self.scooter_scelta = 0;
+                self.acquista_ok = false;
+                self.open(Handler::Showroom, dlg, vec![], vec![]);
+            }
+            103 => {
+                // Vendi
+                if self.state.scooter.stato == -1 {
+                    self.message(
+                        "Vendi lo scooter",
+                        "Scusa, ma quale scooter avresti intenzione di vendere visto che non ne hai neanche uno ???",
+                    );
+                } else {
+                    let base = self.state.scooter.prezzo / 100;
+                    let stato = self.state.scooter.stato;
+                    let mut offerta = if self.state.scooter.attivita == 1 || self.state.scooter.attivita == 4 {
+                        base * (stato as i64 - 10 - self.rng.random(10) as i64)
+                    } else {
+                        base * (stato as i64 - 50 - self.rng.random(10) as i64)
+                    };
+                    if offerta < 50 {
+                        offerta = 50;
+                    }
+                    self.sell_offerta = offerta;
+                    let mut texts = self.scooter_texts();
+                    texts.push((118, mostra_soldi(offerta as u64, self.state.euro)));
+                    self.open(Handler::VendiScooter, 71, texts, vec![]);
+                }
+                let soldi = mostra_soldi(self.state.soldi, self.state.euro);
+                self.set_text(token, 104, soldi);
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_showroom(&mut self, token: u64, id: i32) {
+        match id {
+            121..=126 => {
+                // Preview of the selected scooter (the original shows the
+                // computed speed, then resets the display).
+                self.scooter_scelta = (id - 120) as usize;
+            }
+            1 => {
+                self.acquista_ok = true;
+                self.close(token);
+            }
+            _ => {
+                self.acquista_ok = false;
+                self.scooter_scelta = 0;
+                self.close(token);
+            }
+        }
+    }
+
+    fn on_vendi_scooter(&mut self, token: u64, id: i32) {
+        match id {
+            1 => {
+                self.state.scooter = tabboz_core::state::Scooter::none();
+                self.state.benzina = 0;
+                self.state.soldi += self.sell_offerta as u64;
+                self.close(token);
+                self.update_main();
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_ripara_scooter(&mut self, token: u64, id: i32) {
+        match id {
+            1 => {
+                if self.repair_costo > self.state.soldi as i64 {
+                    self.nomoney(7); // SCOOTER
+                } else {
+                    self.state.scooter.stato = 100;
+                    self.state.soldi -= self.repair_costo as u64;
+                    self.calcola_velocita(false);
+                }
+                self.close(token);
+                if let Some(t) = self.frame_of(Handler::Scooter) {
+                    self.refresh_scooter_frame(t);
+                }
+                self.update_main();
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_trucca_scooter(&mut self, token: u64, id: i32) {
+        match id {
+            121..=124 => {
+                // Carburatore(74) / Marmitta(75) / Pistone(76) / Filtro(77)
+                let dlg = (id - 121 + 74) as u32;
+                let s = &self.state.scooter;
+                let mut texts = vec![
+                    (109, s.nome.clone()),
+                    (105, N_CARBURATORE[s.carburatore as usize].to_string()),
+                    (106, N_MARMITTA[s.marmitta as usize].to_string()),
+                    (107, N_CC[s.cc as usize].to_string()),
+                    (108, N_FILTRO[s.filtro as usize].to_string()),
+                    (104, mostra_soldi(self.state.soldi, self.state.euro)),
+                ];
+                for i in 110..125 {
+                    texts.push((i, mostra_soldi(PEZZI_MEM[(i - 110) as usize] as u64, self.state.euro)));
+                }
+                self.open(Handler::Pezzi, dlg, texts, vec![]);
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_pezzi(&mut self, token: u64, id: i32) {
+        match id {
+            130..=144 => {
+                let idx = (id - 130) as usize;
+                if (PEZZI_MEM[idx] as u64) > self.state.soldi {
+                    self.nomoney(7); // SCOOTER
+                    return;
+                }
+                self.state.soldi -= PEZZI_MEM[idx] as u64;
+                match id {
+                    130..=132 => self.state.scooter.marmitta = id - 129,
+                    133..=136 => self.state.scooter.carburatore = id - 132,
+                    137..=140 => self.state.scooter.cc = id - 136,
+                    _ => self.state.scooter.filtro = id - 140,
+                }
+                self.calcola_velocita(false);
+                self.close(token);
+                if let Some(t) = self.frame_of(Handler::TruccaScooter) {
+                    for (cid, text) in self.scooter_texts() {
+                        self.set_text(t, cid, text);
+                    }
+                }
+                self.update_main();
+            }
+            _ => self.close(token),
+        }
+    }
+
+    // ---- lavoro -----------------------------------------------------------
+
+    fn open_lavoro(&mut self) {
+        let mut texts = vec![];
+        let leccaculo = if self.state.sesso == 'M' {
+            "Fai il leccaculo"
+        } else {
+            "Fai la leccaculo"
+        };
+        texts.push((113, leccaculo.to_string()));
+        self.open(Handler::Lavoro, 13, texts, vec![]);
+        if let Some(t) = self.frame_of(Handler::Lavoro) {
+            self.refresh_lavoro_frame(t);
+        }
+    }
+
+    /// AggiornaLavoro of lavoro.c.
+    fn refresh_lavoro_frame(&mut self, token: u64) {
+        let mut texts = vec![(104, mostra_soldi(self.state.soldi, self.state.euro))];
+        if self.state.numeroditta < 1 {
+            texts.push((105, String::new()));
+            texts.push((106, String::new()));
+            texts.push((107, String::new()));
+        } else {
+            texts.push((107, format!("{}/100", self.state.impegno)));
+            let nome = LAVORO_MEM[self.state.numeroditta as usize].to_string();
+            texts.push((105, nome));
+            texts.push((106, mostra_soldi(self.state.stipendio as u64, self.state.euro)));
+        }
+        for (cid, text) in texts {
+            self.set_text(token, cid, text);
+        }
+    }
+
+    /// GiornoDiLavoro: the two checks shared by every work action.
+    fn giorno_di_lavoro(&mut self, s: &str) -> bool {
+        let ao = self.state.ao();
+        if self.state.numeroditta < 1 {
+            let msg = format!("Forse non ti ricordi che sei disokkupat{ao}...");
+            self.message(s, &msg);
+            return true;
+        }
+        if self.state.vacanza == 2 {
+            let msg = format!("Arrivat{ao} davanti ai cancelli della ditta li trovi inrimediabilmente chiusi...");
+            self.message(s, &msg);
+            return true;
+        }
+        false
+    }
+
+    fn on_lavoro(&mut self, token: u64, id: i32) {
+        let ao = self.state.ao();
+        match id {
+            110 => {
+                // Cerca lavoro
+                if self.state.vacanza == 2 {
+                    let msg = format!("Arrivat{ao} davanti ai cancelli della ditta li trovi inrimediabilmente chiusi...");
+                    self.message("Cerca Lavoro", &msg);
+                    return;
+                }
+                if self.state.numeroditta > 0 {
+                    self.message("Cerca Lavoro", "Forse non ti ricordi che hai gia' un lavoro...");
+                    return;
+                }
+                let n_ditta = self.rng.random(8) + 1; // 1..=8
+                self.interview_ditta = n_ditta as usize;
+                self.interview_accettata = false;
+                self.open(Handler::Interview, 389 + n_ditta as u32, vec![], vec![]);
+            }
+            111 => {
+                // Licenziati
+                if self.giorno_di_lavoro("Licenziati") {
+                    return;
+                }
+                let nome = LAVORO_MEM[self.state.numeroditta as usize];
+                let msg = format!("Sei proprio sicur{ao} di voler dare le dimissioni dalla {nome} ?");
+                if self.confirm("Licenziati", &msg) {
+                    self.state.numeroditta = 0;
+                    self.state.impegno = 0;
+                    self.state.giorni_di_lavoro = 0;
+                    self.state.stipendio = 0;
+                    self.evento();
+                }
+                self.refresh_lavoro_frame(token);
+            }
+            112 => {
+                // Chiedi aumento salario
+                if self.giorno_di_lavoro("Chiedi aumento salario") {
+                    return;
+                }
+                if self.state.impegno > 90 {
+                    if (30 + self.state.fortuna) > (30 + self.rng.random(50)) {
+                        self.message("Chiedi aumento salario", "Forse per questa volta potremmo darti qualcosina in piu'...");
+                        self.state.stipendio += ((self.rng.random(1) + 1) as i64) * 100;
+                        self.state.impegno -= 30;
+                        self.evento();
+                    } else {
+                        if self.state.sesso == 'M' {
+                            self.message("Chiedi aumento salario", "Vedi di scordartelo,bastardo...");
+                        } else {
+                            self.message("Chiedi aumento salario", "Vedi di scordartelo,stronzetta...");
+                        }
+                        self.state.impegno -= 20;
+                        self.evento();
+                    }
+                } else {
+                    self.message("Chiedi aumento salario", "Che cosa vorresti ??? SCORDATELO !!!!");
+                }
+                self.refresh_lavoro_frame(token);
+            }
+            113 => {
+                // Fai il leccaculo
+                if self.giorno_di_lavoro("Fai il leccaculo") {
+                    return;
+                }
+                if self.state.sound_active {
+                    self.bridge.play_sound(503);
+                }
+                if self.state.reputazione > 20 {
+                    self.state.reputazione -= 1;
+                }
+                if self.state.impegno < 99 {
+                    self.state.impegno += 1;
+                }
+                let i = self.rng.random(self.state.fortuna + 3);
+                if i == 0 {
+                    self.evento();
+                }
+                self.refresh_lavoro_frame(token);
+            }
+            114 => {
+                // Elenco ditte / info della propria ditta
+                if self.state.numeroditta == 0 {
+                    self.open(Handler::InfoDitta, 210, vec![], vec![]);
+                } else {
+                    let dlg = (self.state.numeroditta + 289) as u32;
+                    self.open(Handler::InfoDitta, dlg, vec![], vec![]);
+                }
+            }
+            115 => {
+                // Sciopera
+                if self.giorno_di_lavoro("Sciopera") {
+                    return;
+                }
+                if self.state.sound_active {
+                    self.bridge.play_sound(502);
+                }
+                if self.state.reputazione < 85 {
+                    self.state.reputazione += 10;
+                }
+                if self.state.impegno > 19 {
+                    self.state.impegno -= 15;
+                }
+                let i = self.rng.random(self.state.fortuna + 3);
+                if i == 0 {
+                    self.evento();
+                }
+                self.evento();
+                self.refresh_lavoro_frame(token);
+            }
+            116 => {
+                // Lavora
+                if self.giorno_di_lavoro("Lavora") {
+                    return;
+                }
+                if self.state.impegno < 85 {
+                    self.state.impegno += 1;
+                }
+                if self.state.sound_active {
+                    self.bridge.play_sound(501);
+                }
+                self.evento();
+                self.refresh_lavoro_frame(token);
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_interview(&mut self, token: u64, id: i32) {
+        match id {
+            1 => {
+                self.interview_accettata = true;
+                self.close(token);
+            }
+            _ => {
+                self.interview_accettata = false;
+                self.close(token);
+            }
+        }
+    }
+
+    fn on_quiz(&mut self, token: u64, id: i32) {
+        match id {
+            101..=109 => {
+                let i = (id - 101) as usize;
+                self.risposte[i] = !self.risposte[i];
+            }
+            _ => self.close(token),
+        }
+    }
+
+    // ---- tipa -------------------------------------------------------------
+
+    /// AggiornaTipa of tipa.c (including the original label bug: the
+    /// "Cerca Tipo" SetDlgItemText is unconditional, so the label always
+    /// ends up "Cerca Tipo" for male players too).
+    fn refresh_tipa_frame(&mut self, token: u64) {
+        let mut texts: Vec<(i32, String)> = Vec::new();
+        if self.state.rapporti == 0 {
+            // Original bug kept for fidelity: this call overwrites the
+            // "Cerca Tipa" label set just above it.
+            texts.push((101, "Cerca Tipo".to_string()));
+            texts.push((105, String::new()));
+            texts.push((106, String::new()));
+            texts.push((107, String::new()));
+        } else {
+            if self.state.sesso == 'M' {
+                texts.push((101, "Cerca Nuova Tipa".to_string()));
+            } else {
+                texts.push((101, "Cerca Nuovo Tipo".to_string()));
+            }
+            texts.push((105, self.state.nometipa.clone()));
+            texts.push((106, self.state.fig_tipa.to_string()));
+            texts.push((107, format!("{}/100", self.state.rapporti)));
+        }
+        texts.push((104, format!("{}/100", self.state.fama)));
+        for (cid, text) in texts {
+            self.set_text(token, cid, text);
+        }
+    }
+
+    fn open_tipa(&mut self) {
+        self.open(Handler::Tipa, 9, vec![], vec![]);
+        if let Some(t) = self.frame_of(Handler::Tipa) {
+            self.refresh_tipa_frame(t);
+        }
+    }
+
+    fn on_tipa(&mut self, token: u64, id: i32, x: i32, y: i32) {
+        let _ao = self.state.ao();
+        match id {
+            110 => {
+                // Cerca tipa: dialog 91 (M) / 191 (F)
+                let dlg = if self.state.sesso == 'M' { 91 } else { 191 };
+                self.open_cerca_tipa(dlg);
+            }
+            111 => {
+                // Lascia tipa
+                if self.state.rapporti <= 0 {
+                    if self.state.sesso == 'M' {
+                        self.message("Lascia Tipa", "Scusa, che ragazza avresti intenzione di lasciare ???");
+                    } else {
+                        self.message("Lascia Tipo", "Scusa, che tipo avresti intenzione di lasciare, visto che sei sola come un cane ???");
+                    }
+                    return;
+                }
+                let msg = format!("Sei proprio sicuro di voler lasciare {} ?", self.state.nometipa);
+                let title = if self.state.sesso == 'M' { "Lascia tipa" } else { "Molla tipo" };
+                if self.confirm(title, &msg) {
+                    if self.state.sound_active {
+                        self.bridge.play_sound(603);
+                    }
+                    self.state.rapporti = 0;
+                    if self.state.fig_tipa >= 79 && self.state.sesso == 'M' {
+                        self.message(
+                            "Idiota...",
+                            "Appena vengono a sapere quello che hai fatto, i tuoi amici ti prendono a scarpate.\nQualcuno, piu' furbo di te, va a consolarla...",
+                        );
+                        self.state.reputazione -= 8;
+                        if self.state.reputazione < 0 {
+                            self.state.reputazione = 0;
+                        }
+                    }
+                    if self.state.fig_tipa <= 40 && self.state.sesso == 'M' {
+                        self.state.reputazione += 4;
+                        if self.state.reputazione > 100 {
+                            self.state.reputazione = 100;
+                        }
+                    }
+                    self.evento();
+                }
+                self.refresh_tipa_frame(token);
+            }
+            112 => {
+                // Telefona
+                if self.state.rapporti <= 0 {
+                    if self.state.sesso == 'M' {
+                        self.message("Non sei molto intelligente...", "Scusa, che ragazza vorresti chiamare ???");
+                    } else {
+                        self.message("Non sei molto intelligente...", "Scusa, che ragazzo vorresti chiamare, visto che sei sola ???");
+                    }
+                    return;
+                }
+                if self.state.soldi <= 5
+                    && (self.state.abbonamento.creditorest < 2 && self.state.cellular.stato < 0)
+                {
+                    self.message(
+                        "Non toccare quel telefono...",
+                        "Sei fai ancora una telefonata, ti spezzo le gambe, disse tuo padre con un accetta in mano...",
+                    );
+                } else {
+                    if self.state.sound_active {
+                        self.bridge.play_sound(602);
+                    }
+                    if self.state.abbonamento.creditorest >= 2 && self.state.cellular.stato > -1 {
+                        self.state.abbonamento.creditorest -= 2;
+                    } else {
+                        self.state.soldi -= 5;
+                    }
+                    if self.state.rapporti <= 60 {
+                        self.state.rapporti += 1;
+                    }
+                }
+                self.refresh_tipa_frame(token);
+            }
+            113 => {
+                // Esci con la tipa
+                if self.state.rapporti <= 0 {
+                    if self.state.sesso == 'M' {
+                        self.message("Non sei molto intelligente...", "Scusa, con che tipa vorresti uscire ???");
+                    } else {
+                        self.message("Non sei molto intelligente...", "Scusa, ma con chi vorresti uscire, ???");
+                    }
+                    return;
+                }
+                if self.state.sesso == 'M' {
+                    if self.state.scooter.stato <= 0 {
+                        self.message(
+                            "Compra lo scooter",
+                            "Finche' non comprerai lo scooter, non usciremo piu' insieme...",
+                        );
+                        return;
+                    }
+                    if self.state.scooter.attivita != 1 {
+                        let att = N_ATTIVITA[self.state.scooter.attivita as usize];
+                        let msg = format!("Finche' il tuo scooter restera' {att} non potremo uscire insieme...");
+                        self.message("Risistema la scooter", &msg);
+                        return;
+                    }
+                    if self.state.scooter.stato <= 35 {
+                        self.message(
+                            "Ripara lo scooter",
+                            "Finche' non riparerai lo scooter, non usciremo piu' insieme...",
+                        );
+                        return;
+                    }
+                }
+                if self.state.soldi < 15 {
+                    if self.state.sesso == 'M' {
+                        self.message(
+                            "Sei povero",
+                            "Se mi vuoi portare fuori, cerca di avere almeno un po' di soldi...",
+                        );
+                    } else {
+                        self.message("Che palle", "Oh tipa... cioe' non posso pagare sempre tutto io, cioe' ohhhh...");
+                    }
+                    return;
+                }
+                self.state.soldi -= 15;
+                self.state.rapporti += 5;
+                if self.state.rapporti > 100 {
+                    self.state.rapporti = 100;
+                }
+                if self.state.fig_tipa > self.state.fama {
+                    self.state.fama += 1;
+                    if self.state.fama > 100 {
+                        self.state.fama = 100;
+                    }
+                }
+                self.state.benzina -= 3;
+                if self.state.benzina < 1 {
+                    self.state.benzina = 0;
+                }
+                self.calcola_velocita(false);
+                self.refresh_tipa_frame(token);
+                self.update_main();
+            }
+            130 => {
+                // BMPTipa "palpatina" (coordinate check of tabimg.c).
+                let in_tette = (138..=170).contains(&x) && (50..=65).contains(&y);
+                let in_culo = (104..=136).contains(&x) && (78..=166).contains(&y);
+                if in_tette || in_culo {
+                    let r = self.state.rapporti;
+                    let fig = self.state.fig_tipa;
+                    if r > 0 && r < 20 + fig / 2 {
+                        if self.state.sound_active {
+                            self.bridge.play_sound(604);
+                        }
+                        self.message("Palpatina...", "Brutto porco, che cazzo tocchi ?");
+                        if self.state.rapporti > 5 {
+                            self.state.rapporti -= 3;
+                        }
+                        if let Some(t) = self.frame_of(Handler::Tipa) {
+                            self.refresh_tipa_frame(t);
+                        }
+                    } else if r > 0 && r < 30 + fig / 2 {
+                        self.message("Palpatina...", "Dai, smettila... Voi uomini pensato solo a quello...");
+                    } else if r >= 30 + fig / 2 {
+                        self.message("Palpatina...", "Mmhhhhhhhh.........");
+                    }
+                }
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn open_cerca_tipa(&mut self, dlg: u32) {
+        let fig_temp = self.rng.random(71) + 30;
+        self.fig_temp = fig_temp;
+        let (desc, nome_id) = if self.state.sesso == 'M' {
+            (descrizione_tipa(fig_temp), 200 + self.rng.random(20))
+        } else {
+            (descrizione_tipo(fig_temp), 1200 + self.rng.random(20))
+        };
+        self.nome_temp = tabboz_win::strings::find(nome_id as u16).unwrap_or("").to_string();
+        let texts = vec![
+            (107, desc.to_string()),
+            (105, self.nome_temp.clone()),
+            (106, format!("{fig_temp}/100")),
+        ];
+        self.open(Handler::CercaTipa, dlg, texts, vec![]);
+    }
+
+    fn on_cerca_tipa(&mut self, token: u64, id: i32) {
+        match id {
+            101 => {
+                // Ci provo...
+                let fig_temp = self.fig_temp;
+                let success =
+                    (fig_temp * 2 + self.rng.random(50)) <= (self.state.fama + self.state.reputazione + self.rng.random(30));
+                if success {
+                    if self.state.sesso == 'M' {
+                        self.message(
+                            "E' andata bene !",
+                            "Con il tuo fascino nascosto da tabbozzo, seduci la tipa e ti ci metti insieme.",
+                        );
+                    } else {
+                        self.message("Qualcono ti caga...", "Ora non ti puoi piu' lamentare di essere sola...");
+                    }
+                    if self.state.rapporti > 0 {
+                        // Gia' impegnato: DueDonne (92 M / 192 F).
+                        let dlg = if self.state.sesso == 'M' { 92 } else { 192 };
+                        let resta = format!("Resto con {}", self.state.nometipa);
+                        let nuova = if self.state.nometipa == self.nome_temp {
+                            if self.state.sesso == 'M' {
+                                "Preferisco quella nuova".to_string()
+                            } else {
+                                "Preferisco quello nuovo".to_string()
+                            }
+                        } else {
+                            format!("Preferisco {}", self.nome_temp)
+                        };
+                        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                        let _ = self.bridge.tx.send_event(UiRequest::Ask {
+                            kind: AskKind::Dialog {
+                                id: dlg,
+                                texts: vec![(2, resta), (102, nuova)],
+                            },
+                            reply: reply_tx,
+                        });
+                        let answer = reply_rx.recv().unwrap_or(DialogAnswer::Ok);
+                        match answer {
+                            DialogAnswer::Ok => {} // resta con la vecchia
+                            DialogAnswer::Yes => {
+                                // 101: la vita e' bella...
+                                if self.state.sesso == 'M' {
+                                    let msg = format!(
+                                        "Mentre sei appartato con la {}, arriva la tua ragazza, {}, ti tira uno schiaffo e ti lascia.Capendo finalmente di che pasta sei fatto, anche la {} si allontana...",
+                                        self.nome_temp, self.state.nometipa, self.nome_temp
+                                    );
+                                    self.message("La vita e' bella", &msg);
+                                } else {
+                                    let msg = format!(
+                                        "{} viene a sapere che di {}, gli spacca la faccia e ti molla...Dopo questa tragica esperienza anche {} sparisce...",
+                                        self.state.nometipa, self.nome_temp, self.nome_temp
+                                    );
+                                    self.message("La vita e' bella", &msg);
+                                }
+                                self.state.rapporti = 0;
+                                self.state.reputazione -= 8;
+                                if self.state.reputazione < 0 {
+                                    self.state.reputazione = 0;
+                                }
+                                self.state.fama -= 4;
+                                if self.state.fama < 0 {
+                                    self.state.fama = 0;
+                                }
+                            }
+                            DialogAnswer::No => {
+                                // 102: preferisci quella nuova...
+                                self.state.nometipa = self.nome_temp.clone();
+                                self.state.fig_tipa = fig_temp;
+                                self.state.rapporti = 30 + self.rng.random(15);
+                                self.state.fama += fig_temp / 10;
+                                if self.state.fama > 100 {
+                                    self.state.fama = 100;
+                                }
+                                self.state.reputazione += fig_temp / 13;
+                                if self.state.reputazione > 100 {
+                                    self.state.reputazione = 100;
+                                }
+                            }
+                        }
+                    } else {
+                        self.state.nometipa = self.nome_temp.clone();
+                        self.state.fig_tipa = fig_temp;
+                        self.state.rapporti = 30 + self.rng.random(15);
+                        self.state.fama += fig_temp / 10;
+                        if self.state.fama > 100 {
+                            self.state.fama = 100;
+                        }
+                        self.state.reputazione += fig_temp / 13;
+                        if self.state.reputazione > 100 {
+                            self.state.reputazione = 100;
+                        }
+                    }
+                } else {
+                    // 2 di picche...
+                    if self.state.sound_active {
+                        self.bridge.play_sound(601);
+                    }
+                    self.state.ddp += 1;
+                    self.state.reputazione -= 2;
+                    if self.state.reputazione < 0 {
+                        self.state.reputazione = 0;
+                    }
+                    self.state.fama -= 2;
+                    if self.state.fama < 0 {
+                        self.state.fama = 0;
+                    }
+                    let i = if self.state.sesso == 'M' {
+                        300 + self.rng.random(20)
+                    } else {
+                        1300 + self.rng.random(20)
+                    };
+                    let sfiga = tabboz_win::strings::find(i as u16).unwrap_or("").to_string();
+                    self.ddp_clicks = 0;
+                    self.open(Handler::DueDiPicche, 95, vec![(105, sfiga)], vec![]);
+                }
+                self.evento();
+                self.close(token);
+                if let Some(t) = self.frame_of(Handler::Tipa) {
+                    self.refresh_tipa_frame(t);
+                }
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_due_di_picche(&mut self, token: u64, id: i32) {
+        match id {
+            201 => {
+                self.ddp_clicks += 1;
+                if self.ddp_clicks > 5 {
+                    let msg = format!(
+                        "Fino ad ora hai preso {} due di picche !\nNon ti preoccupare, capita a tutti di prendere qualche due di picche nella vita ...",
+                        self.state.ddp
+                    );
+                    self.message("La vita e' bella...", &msg);
+                    self.ddp_clicks = 0;
+                }
+            }
+            _ => self.close(token),
+        }
+    }
+
+    // ---- telefonino -------------------------------------------------------
+
+    /// AggiornaCell of telefono.c.
+    fn refresh_cellular_frame(&mut self, token: u64) {
+        let mut texts = vec![(104, mostra_soldi(self.state.soldi, self.state.euro))];
+        if self.state.cellular.stato > -1 {
+            texts.push((120, self.state.cellular.nome.clone()));
+        } else {
+            texts.push((120, String::new()));
+        }
+        if self.state.abbonamento.creditorest > -1 {
+            texts.push((121, self.state.abbonamento.nome.clone()));
+            texts.push((
+                122,
+                mostra_soldi(self.state.abbonamento.creditorest as u64, self.state.euro),
+            ));
+        } else {
+            texts.push((121, String::new()));
+            texts.push((122, String::new()));
+        }
+        for (cid, text) in texts {
+            self.set_text(token, cid, text);
+        }
+    }
+
+    fn cellular_vacanza(&mut self) -> bool {
+        if self.state.vacanza == 2 {
+            self.message(
+                "Telefonino",
+                "Stranamente, in un giorno di vacanza, il negozio e' chiuso...",
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open_cellular(&mut self) {
+        self.open(Handler::Cellular, 120, vec![], vec![]);
+        if let Some(t) = self.frame_of(Handler::Cellular) {
+            self.refresh_cellular_frame(t);
+        }
+    }
+
+    fn on_cellular(&mut self, token: u64, id: i32) {
+        match id {
+            110 => {
+                // Compra
+                if !self.cellular_vacanza() {
+                    self.cellular_scelta = 0;
+                    let mut texts = vec![(104, mostra_soldi(self.state.soldi, self.state.euro))];
+                    for (i, cell) in CELLULAR_MEM.iter().enumerate() {
+                        texts.push((
+                            120 + i as i32,
+                            mostra_soldi(cell.3 as u64, self.state.euro),
+                        ));
+                    }
+                    self.open(Handler::CompraCellular, 121, texts, vec![]);
+                }
+            }
+            111 => {
+                // Vendi
+                if !self.cellular_vacanza() {
+                    if self.state.cellular.stato > -1 {
+                        let offerta = self.state.cellular.prezzo / 2 + 15;
+                        let msg = format!(
+                            "Ti posso dare {} per il tuo telefonino... vuoi vendermelo ?",
+                            mostra_soldi(offerta as u64, self.state.euro)
+                        );
+                        if self.confirm("Telefonino", &msg) {
+                            self.state.cellular.stato = -1;
+                            self.state.soldi += offerta as u64;
+                        } else {
+                            self.message("Telefonino", "Allora vai a farti fottere, pirletta !");
+                        }
+                    } else {
+                        self.message("Telefonino", "Che telefonino vuoi vendere, pirletta ?");
+                    }
+                    self.refresh_cellular_frame(token);
+                }
+            }
+            112 => {
+                // Abbonamento
+                if !self.cellular_vacanza() {
+                    self.abbonamento_scelta = 0;
+                    let mut texts = vec![(104, mostra_soldi(self.state.soldi, self.state.euro))];
+                    if self.state.abbonamento.creditorest > -1 {
+                        texts.push((105, self.state.abbonamento.nome.clone()));
+                    }
+                    for (i, abbonamento) in ABBONAMENT_MEM.iter().enumerate() {
+                        texts.push((
+                            110 + i as i32,
+                            mostra_soldi(abbonamento.4 as u64, self.state.euro),
+                        ));
+                    }
+                    self.open(Handler::AbbonaCellular, 123, texts, vec![]);
+                }
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_compra_cellular(&mut self, token: u64, id: i32) {
+        match id {
+            110..=112 => {
+                self.cellular_scelta = (id - 110) as usize;
+            }
+            1 => {
+                let sel = self.cellular_scelta;
+                let (dual, fama, _, prezzo, nome) = CELLULAR_MEM[sel];
+                if (prezzo as u64) > self.state.soldi {
+                    self.nomoney(123); // CELLULRABBONAM
+                } else {
+                    self.state.soldi -= prezzo as u64;
+                    self.state.cellular = tabboz_core::state::Cellular {
+                        dual,
+                        fama,
+                        stato: 100,
+                        prezzo,
+                        nome: nome.to_string(),
+                    };
+                    self.state.fama += fama;
+                    if self.state.fama > 100 {
+                        self.state.fama = 100;
+                    }
+                }
+                self.close(token);
+                if let Some(t) = self.frame_of(Handler::Cellular) {
+                    self.refresh_cellular_frame(t);
+                }
+                self.update_main();
+            }
+            _ => self.close(token),
+        }
+    }
+
+    fn on_abbona_cellulare(&mut self, token: u64, id: i32) {
+        match id {
+            110..=118 => {
+                self.abbonamento_scelta = (id - 110) as usize;
+            }
+            1 => {
+                let sel = self.abbonamento_scelta;
+                let (abbonamento, _dualonly, creditorest, _fama, prezzo, nome) = ABBONAMENT_MEM[sel];
+                if (prezzo as u64) > self.state.soldi {
+                    self.nomoney(123);
+                } else if abbonamento == 1 {
+                    // Abbonamento, no problem...
+                    self.state.soldi -= prezzo as u64;
+                    self.state.abbonamento = tabboz_core::state::Abbonamento {
+                        abbonamento,
+                        dualonly: _dualonly,
+                        creditorest,
+                        fama: _fama,
+                        prezzo,
+                        nome: nome.to_string(),
+                    };
+                    if self.state.sound_active && self.state.cellular.stato > -1 {
+                        self.bridge.play_sound(602);
+                    }
+                } else if self.state.abbonamento.creditorest > -1
+                    && self.state.abbonamento.nome == nome
+                {
+                    // Ricarica della stessa SIM...
+                    self.state.soldi -= prezzo as u64;
+                    self.state.abbonamento.creditorest += creditorest;
+                    if self.state.sound_active && self.state.cellular.stato > -1 {
+                        self.bridge.play_sound(602);
+                    }
+                } else {
+                    self.message(
+                        "Telefonino",
+                        "Oh, che  te ne fai di una ricarica se non hai la sim ???",
+                    );
+                }
+                self.close(token);
+                if let Some(t) = self.frame_of(Handler::Cellular) {
+                    self.refresh_cellular_frame(t);
+                }
+            }
+            _ => self.close(token),
+        }
+    }
+
+    // ---- configuration ----------------------------------------------------
+
+    fn open_configuration(&mut self) {
+        // Radios of the difficulty level (fortuna) and the toggles.
+        let mut radios = vec![];
+        let fortuna = self.state.fortuna;
+        let radio = if fortuna >= 20 {
+            101
+        } else if fortuna >= 15 {
+            102
+        } else if fortuna >= 10 {
+            103
+        } else if fortuna >= 5 {
+            104
+        } else {
+            105
+        };
+        radios.push(radio);
+        let mut checks = vec![];
+        if self.state.euro {
+            checks.push(107);
+        }
+        if self.state.sound_active {
+            checks.push(110);
+        }
+        let t = self.token(Handler::Configuration);
+        let _ = self.bridge.tx.send_event(UiRequest::ShowFrame {
+            token: t,
+            dlg_id: 14,
+            texts: vec![],
+            radios,
+            checks,
+        });
+    }
+
+    fn on_configuration(&mut self, token: u64, id: i32) {
+        match id {
+            101 => self.state.fortuna = 20,
+            102 => self.state.fortuna = 15,
+            103 => self.state.fortuna = 10,
+            104 => self.state.fortuna = 5,
+            105 => self.state.fortuna = 0,
+            107 => {
+                self.state.euro = !self.state.euro;
+            }
+            110 => {
+                self.state.sound_active = !self.state.sound_active;
+            }
+            203 => {
+                // Reset: dialog 15 (scelta del sesso).
+                self.format_sesso = if self.rng.random(2) == 1 { 'M' } else { 'F' };
+                self.open(Handler::Format, 15, vec![], vec![102]);
+            }
+            _ => {
+                crate::save::save(&self.state); // SalvaTutto on close (EM)
+                self.close(token);
+            }
+        }
+    }
+
+    fn on_format(&mut self, token: u64, id: i32) {
+        match id {
+            100 => self.format_sesso = 'M',
+            101 => self.format_sesso = 'F',
+            102 => {
+                self.format_sesso = if self.rng.random(2) == 1 { 'M' } else { 'F' }
+            }
+            _ => self.close(token),
+        }
+    }
+}
+
+/// DescrizioneTipa of tipa.c.
+fn descrizione_tipa(f: i32) -> &'static str {
+    if f > 97 {
+        "Ultramegafiga"
+    } else if f > 90 {
+        "Fighissima"
+    } else if f > 83 {
+        "Molto figa"
+    } else if f > 72 {
+        "Figa"
+    } else if f > 67 {
+        "Abbastanza Figa"
+    } else if f > 55 {
+        "Interessante"
+    } else if f > 45 {
+        "Passabile"
+    } else if f > 35 {
+        "Puo' piacere.."
+    } else {
+        "E' un tipo..."
+    }
+}
+
+/// DescrizioneTipo of tipa.c.
+fn descrizione_tipo(f: i32) -> &'static str {
+    if f > 97 {
+        "Ultramegafigo"
+    } else if f > 90 {
+        "Bellissimo"
+    } else if f > 83 {
+        "Molto figo"
+    } else if f > 72 {
+        "Bello"
+    } else if f > 67 {
+        "Abbastanza Figo"
+    } else if f > 55 {
+        "Interessante"
+    } else if f > 45 {
+        "Passabile"
+    } else if f > 35 {
+        "Puo' piacere.."
+    } else {
+        "Inutile..."
+    }
+}

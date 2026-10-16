@@ -134,6 +134,10 @@ struct FrameState {
     checked: HashSet<i32>,
     /// Render offset of this frame inside the window (modal dialogs).
     offset: (i32, i32),
+    /// Which tipa bitmap BMPTipa shows (0 normal, 1 Babbo Natale, 2 mare).
+    tipa_img: i32,
+    /// Position of the last released click, relative to the clicked control.
+    last_click: Option<(i32, i32)>,
 }
 
 impl Frame {
@@ -196,6 +200,17 @@ impl Frame {
     /// Position of this frame inside the window surface (modal dialogs).
     pub fn set_offset(&mut self, x: i32, y: i32) {
         self.state.offset = (x, y);
+    }
+
+    /// Selects the tipa bitmap of BMPTipa (current_tipa + 1204).
+    pub fn set_tipa_image(&mut self, n: i32) {
+        self.state.tipa_img = n;
+    }
+
+    /// Click position relative to the last clicked control (frame-local),
+    /// consumed by the caller; used by the BMPTipa "palpatina" easter egg.
+    pub fn take_last_click(&mut self) -> Option<(i32, i32)> {
+        self.state.last_click.take()
     }
 
     pub fn dialog_id(&self) -> u32 {
@@ -409,6 +424,8 @@ impl Frame {
         if let Some(idx) = self.state.pressed_control.take() {
             if self.hit_test(x, y, fonts) == Some(idx) {
                 let c = &self.dlg.controls[idx];
+                let (cx, cy, _, _) = self.control_rect(c);
+                self.state.last_click = Some((x - cx, y - cy));
                 match c.kind {
                     ControlKind::Button | ControlKind::BorBtn => return Some(UiEvent::Button(c.id)),
                     ControlKind::BorRadio => {
@@ -613,9 +630,16 @@ impl Frame {
                 5 => shade_vbump(surf, x, y, w, h),
                 _ => {}
             },
-            ControlKind::BmpView | ControlKind::BmpTipa => {
+            ControlKind::BmpView => {
                 let img = self.composed_tabboz();
                 surf.blit_clip(&img, x, y, x, y, w, h);
+            }
+            ControlKind::BmpTipa => {
+                // BMPTipa: single bitmap 1204 + current_tipa (tabimg.c).
+                let name = (1204 + self.state.tipa_img).to_string();
+                if let Some(img) = self.cached_bitmap(&name) {
+                    surf.blit_clip(&img, x, y, x, y, w, h);
+                }
             }
             ControlKind::Combobox => {
                 surf.rect(x, y, w, h, WHITE);

@@ -61,8 +61,9 @@ pub enum AskKind {
 
 /// UI -> Game actions.
 pub enum GameAction {
-    /// A button/radio click on the frame with this token.
-    Button { token: u64, id: i32 },
+    /// A button/radio click on the frame with this token; (x, y) is the click
+    /// position relative to the control (BMPTipa palpatina coordinates).
+    Button { token: u64, id: i32, x: i32, y: i32 },
     /// A menu bar command (main window only).
     Command { id: u16 },
     /// The frame was closed (close button / OK / Cancel).

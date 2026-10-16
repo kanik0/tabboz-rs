@@ -260,6 +260,9 @@ impl App {
             }
             MouseAction::Up => {
                 if let Some(ev) = top.frame.mouse_up(lx, ly, &mut self.fonts) {
+                    // Click position relative to the clicked control
+                    // (BMPTipa palpatina coordinates).
+                    let pos = top.frame.take_last_click().unwrap_or((-1, -1));
                     match (ev, is_ask) {
                         (UiEvent::Button(id), true) => {
                             let ask = self.frames.pop().and_then(|f| f.ask);
@@ -273,7 +276,12 @@ impl App {
                             }
                         }
                         (UiEvent::Button(id), false) => {
-                            let _ = self.send_game(GameAction::Button { token, id });
+                            let _ = self.send_game(GameAction::Button {
+                                token,
+                                id,
+                                x: pos.0,
+                                y: pos.1,
+                            });
                         }
                         (UiEvent::Command(_), _) => {}
                         (UiEvent::Close, _) => {
@@ -298,7 +306,8 @@ impl App {
     fn on_main_event(&mut self, event_loop: &ActiveEventLoop, ev: UiEvent) {
         match ev {
             UiEvent::Button(id) => {
-                let _ = self.send_game(GameAction::Button { token: 0, id });
+                let pos = self.main.take_last_click().unwrap_or((-1, -1));
+                let _ = self.send_game(GameAction::Button { token: 0, id, x: pos.0, y: pos.1 });
             }
             UiEvent::Command(id) => {
                 let _ = self.send_game(GameAction::Command { id });

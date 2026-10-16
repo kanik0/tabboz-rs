@@ -23,6 +23,11 @@ pub trait Interact {
     /// Modal dialog with only an OK button (MostraMetallone and friends):
     /// dialog id plus (control id -> text) overrides.
     fn dialog(&mut self, _id: u32, _set_text: &[(i32, String)]) {}
+    /// Modal dialog with multiple buttons (DueDonne): returns the clicked
+    /// button id (101 nuova, 102 resta, 1/0 = default/close = resta).
+    fn choice(&mut self, _id: u32, _set_text: &[(i32, String)]) -> i32 {
+        1
+    }
     /// TabbozPlaySound, only called when sound is active.
     fn play_sound(&mut self, _id: u16) {}
 }
@@ -310,7 +315,59 @@ pub fn evento(state: &mut GameState, rng: &mut Rng, ui: &mut dyn Interact) {
                 if state.rapporti > 0 {
                     // gia' impegnato: dialog DueDonne (92 M / 192 F)
                     let dlg = if state.sesso == 'M' { 92 } else { 192 };
-                    ui.dialog(dlg, &[]);
+                    let resta = format!("Resto con {}", state.nometipa);
+                    let nuova = if state.nometipa == nome_temp {
+                        if state.sesso == 'M' {
+                            "Preferisco quella nuova".to_string()
+                        } else {
+                            "Preferisco quello nuovo".to_string()
+                        }
+                    } else {
+                        format!("Preferisco {nome_temp}")
+                    };
+                    let answer = ui.choice(dlg, &[(2, resta), (102, nuova)]);
+                    if answer == 101 {
+                        // Ottima scelta... (tipa.c DueDonne case 101)
+                        if state.sesso == 'M' {
+                            ui.message(
+                                "La vita e' bella",
+                                &format!(
+                                    "Mentre sei appartato con la {nome_temp}, arriva la tua ragazza, {}, ti tira uno schiaffo e ti lascia.Capendo finalmente di che pasta sei fatto, anche la {nome_temp} si allontana...",
+                                    state.nometipa
+                                ),
+                            );
+                        } else {
+                            ui.message(
+                                "La vita e' bella",
+                                &format!(
+                                    "{} viene a sapere che di {nome_temp}, gli spacca la faccia e ti molla...Dopo questa tragica esperienza anche {nome_temp} sparisce...",
+                                    state.nometipa
+                                ),
+                            );
+                        }
+                        state.rapporti = 0;
+                        state.reputazione -= 8;
+                        if state.reputazione < 0 {
+                            state.reputazione = 0;
+                        }
+                        state.fama -= 4;
+                        if state.fama < 0 {
+                            state.fama = 0;
+                        }
+                    } else if answer == 102 {
+                        // Preferisci quella nuova...
+                        state.nometipa = nome_temp.clone();
+                        state.fig_tipa = fig_temp;
+                        state.rapporti = 30 + rng.random(15);
+                        state.fama += fig_temp / 10;
+                        if state.fama > 100 {
+                            state.fama = 100;
+                        }
+                        state.reputazione += fig_temp / 13;
+                        if state.reputazione > 100 {
+                            state.reputazione = 100;
+                        }
+                    }
                 } else {
                     state.nometipa = nome_temp.clone();
                     state.fig_tipa = fig_temp;
