@@ -334,3 +334,36 @@ fn message_box_text_stays_inside_the_body() {
         );
     }
 }
+
+#[test]
+fn famiglia_ok_button_renders_the_bwcc_bitmap_face() {
+    // Dialog 5 (Famiglia): CONTROL "Button", 1, "BorBtn" is the OK button
+    // with resource-editor junk text; BWCC draws the chrome face 1001 —
+    // pixel-identical comparison catches any labeled-button regression.
+    let a = tabboz_win::assets::CHROME_BITMAPS
+        .iter()
+        .find(|a| a.name == "1001")
+        .expect("chrome 1001");
+    let img = tabboz_win::img::decode_bmp(a.data).unwrap();
+    let mut frame = Frame::new(5);
+    let mut fonts = Fonts::new(1);
+    let (w, h) = frame.window_size();
+    let mut buf = vec![0u32; (w * h) as usize];
+    {
+        let mut s = Surface::new(&mut buf, w, h, 1);
+        frame.render(&mut s, &mut fonts);
+    }
+    let get = |x: i32, y: i32| buf[(y * w + x) as usize];
+    // Button rect: (192, 48) 33x21 DLU -> px (386, 118) 66x42, centered face.
+    let (bx, by) = (2 + 192 * 2, 20 + 48 * 2); // client origin (2, BORDER+TITLE_H)
+    let (ox, oy) = ((66 - img.w) / 2, (42 - img.h) / 2);
+    let mut mismatch = 0;
+    for y in 0..img.h {
+        for x in 0..img.w {
+            if get(bx + ox + x, by + oy + y) != (img.data[(y * img.w + x) as usize] & 0x00FF_FFFF) {
+                mismatch += 1;
+            }
+        }
+    }
+    assert_eq!(mismatch, 0, "OK face not rendered (or offset wrong)");
+}

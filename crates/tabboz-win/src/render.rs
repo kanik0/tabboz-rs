@@ -631,18 +631,20 @@ impl Frame {
         }
         match c.kind {
             ControlKind::Button | ControlKind::BorBtn => {
-                // BWCC bitmap buttons. OK/Cancel (ids 1/2) carry an empty
-                // text in the .rc templates and draw the chrome faces
-                // 1001/1002 centered. BS_OWNERDRAW (0x8000) BorBtns —
-                // with empty OR junk text ("Button" leftovers of the
-                // resource editor) — show the game bitmap whose resource
+                // BWCC bitmap buttons. OK/Cancel BorBtns (ids 1/2) ALWAYS
+                // draw the chrome faces 1001/1002 — the .rc carries junk
+                // text on them ("Button", "OK") and the web port uses the
+                // bitmap for all of them. BS_OWNERDRAW (0x8000) BorBtns —
+                // empty OR junk text — show the game bitmap whose resource
                 // id is the control id + 1000 (shop previews, firm logos,
                 // phone photos, trucca images, the About picture...),
                 // stretched to the control rect: the same id mapping and
                 // sizing the web port uses.
                 let text = self.text(c);
-                if c.kind == ControlKind::BorBtn && (text.is_empty() || c.style & 0x8000 != 0) {
-                    if matches!(c.id, 1 | 2) && text.is_empty() {
+                if c.kind == ControlKind::BorBtn
+                    && (matches!(c.id, 1 | 2) || text.is_empty() || c.style & 0x8000 != 0)
+                {
+                    if matches!(c.id, 1 | 2) {
                         let bmp = if c.id == 1 { "1001" } else { "1002" };
                         if let Some(img) = self.cached_chrome(bmp) {
                             let (ox, oy) = ((w - img.w) / 2, (h - img.h) / 2);
