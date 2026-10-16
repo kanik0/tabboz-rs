@@ -1,15 +1,20 @@
 // Tabboz Simulator - macOS port (pure Rust).
 //
-// Architecture: the winit event loop owns the window and the frame stack;
-// the game logic runs on its own thread (like the original message loop)
-// and drives the UI through UiRequest events, blocking on modal answers.
-// Sounds play on a third thread (rodio), the state persists as JSON.
+// Architecture (faithful to the original): the game logic runs on its own
+// thread (like the original message loop) and drives real OS windows —
+// the main window, one window per game dialog, one per message box —
+// through UiRequest events, blocking on modal answers. Like the original
+// DialogBox(), every dialog is a separate window with its own size and
+// window-relative mouse coordinates, which removes the whole class of
+// offset/clipping bugs; and like the original SW_HIDE, the main window
+// is hidden while a game dialog is open.
 
 mod game;
 mod save;
 mod sound;
 mod ui;
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -25,16 +30,21 @@ use winit::window::{Window, WindowId};
 
 use crate::ui::UiBridge;
 
-/// An open frame: a game dialog, an event dialog or a message box.
-struct OpenFrame {
+/// A dialog or message-box window, with its own frame and buffer.
+struct WinCtx {
+    /// Last mouse position in this window (logical), tracked from CursorMoved.
+    last_mouse: (i32, i32),
+    window: Arc<Window>,
+    surface: softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Arc<Window>>,
     frame: Frame,
-    /// Game dialog token (0 for ask/message frames).
+    fonts: Fonts,
+    scale: i32,
+    /// Game dialog token (0 for message boxes / ask frames).
     token: u64,
-    /// Blocking request being answered by this frame, if any.
-    ask: Option<Ask>,
-    /// Like the original ShowWindow(WIN_PICCOLO = SW_HIDE): game dialogs
-    /// hide the main window, that stays up for about/personal info/config.
+    /// The main window is hidden while this dialog is open (SW_HIDE).
     hides_main: bool,
+    /// Blocking request answered by this window, if any.
+    ask: Option<Ask>,
 }
 
 struct Ask {
@@ -43,121 +53,175 @@ struct Ask {
 }
 
 struct App {
-    window: Option<Arc<Window>>,
-    surface: Option<softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Arc<Window>>>,
-    fonts: Fonts,
-    /// Integer render scale (round of the window scale factor: 1 or 2).
-    scale: i32,
-    /// Where the main window is drawn inside the (dynamic) window content.
-    main_offset: (i32, i32),
-    main: Frame,
-    snapshot: Option<MainSnapshot>,
-    frames: Vec<OpenFrame>,
+    // Main window.
+    main: Option<MainWin>,
+    // Dialog windows, by winit WindowId.
+    dialogs: HashMap<WindowId, WinCtx>,
+    // The modal window on top of the stack (the only one accepting input
+    // while the game thread is blocked on it).
+    modal: Option<WindowId>,
     game_tx: Option<Sender<GameAction>>,
-    proxy: Option<EventLoopProxy<UiRequest>>,
     sound_tx: Option<Sender<u16>>,
-    /// Last physical mouse position (tracked from CursorMoved).
-    mouse: (f64, f64),
+    proxy: Option<EventLoopProxy<UiRequest>>,
+}
+
+struct MainWin {
+    /// Last mouse position in this window (logical), tracked from CursorMoved.
+    last_mouse: (i32, i32),
+    window: Arc<Window>,
+    surface: softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Arc<Window>>,
+    frame: Frame,
+    fonts: Fonts,
+    scale: i32,
 }
 
 impl App {
     fn new(proxy: EventLoopProxy<UiRequest>) -> Self {
         App {
-            window: None,
-            surface: None,
-            fonts: Fonts::new(1),
-            main: Frame::new(1), // MAIN
-            snapshot: None,
-            frames: Vec::new(),
+            main: None,
+            dialogs: HashMap::new(),
+            modal: None,
             game_tx: None,
-            proxy: Some(proxy),
             sound_tx: None,
-            scale: 1,
-            main_offset: (0, 0),
-            mouse: (0.0, 0.0),
+            proxy: Some(proxy),
         }
     }
 
-    // ---- rendering -------------------------------------------------------
+    // ---- window helpers --------------------------------------------------
 
-    /// Window logical size: the main window, grown to fit the largest open
-    /// frame (dialogs like Scuola are 530px wide, wider than the 412px
-    /// main; in the original each dialog was a separate OS window).
-    /// Every window gets a margin like a real desktop.
-    const MARGIN: i32 = 12;
-
-    fn content_size(&self) -> (i32, i32) {
-        let (mut w, mut h) = self_size(&self.main);
-        for open in &self.frames {
-            let (fw, fh) = open.frame.window_size();
-            w = w.max(fw);
-            h = h.max(fh);
-        }
-        (w + 2 * Self::MARGIN, h + 2 * Self::MARGIN)
-    }
-
-    /// Recomputes the window size and the offset of every frame (centered
-    /// in the window); render and mouse routing share these offsets, so a
-    /// click always lands where the frame is actually drawn.
-    fn layout(&mut self) -> (i32, i32) {
-        let (w, h) = self.content_size();
-        let (mw, mh) = self_size(&self.main);
-        self.main_offset = (
-            (w - mw) / 2,
-            if self.frames.iter().any(|f| f.hides_main) { 0 } else { (h - mh) / 2 },
-        );
-        self.main.set_offset(self.main_offset.0, self.main_offset.1);
-        for open in &mut self.frames {
-            let (fw, fh) = open.frame.window_size();
-            let off = ((w - fw) / 2, (h - fh) / 2);
-            open.frame.set_offset(off.0, off.1);
-        }
-        (w, h)
-    }
-
-    fn redraw(&mut self) {
-        // Dynamic layout: resize the window when the open frames need more
-        // room, then center everything (render + hit testing share the
-        // same offsets). Runs first, before any borrow of self is live.
-        let (lw, lh) = self.layout();
-        if let Some(window) = &self.window {
-            let want = winit::dpi::LogicalSize::new(lw as f64, lh as f64);
-            let cur = window.inner_size().to_logical::<f64>(window.scale_factor());
-            if (cur.width.round() as i32, cur.height.round() as i32) != (lw, lh) {
-                let _ = window.request_inner_size(want);
-            }
-        }
-
-        let Some(surface) = &mut self.surface else { return };
-
-        let scale = self.scale;
+    fn render_win(
+        window: &Window,
+        surface: &mut softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Arc<Window>>,
+        frame: &mut Frame,
+        fonts: &mut Fonts,
+        scale: i32,
+    ) {
+        let (lw, lh) = frame.window_size();
         let (pw, ph) = (lw * scale, lh * scale);
-
         let mut physical = vec![0u32; (pw * ph) as usize];
         {
             let mut s = Surface::new(&mut physical, lw, lh, scale);
-            // The whole window is the desktop: teal, like the web port.
-            // Everything (main window, dialogs, message boxes) floats on
-            // it; the margin around the main window shows as desktop, not
-            // as the black background of the buffer.
-            s.fill(tabboz_win::theme::TEAL);
-            // Desktop mode: game dialogs hide the main window (like the
-            // original SW_HIDE); otherwise the main window stays up.
-            let desktop = self.frames.iter().any(|f| f.hides_main);
-            if !desktop {
-                self.main.render(&mut s, &mut self.fonts);
-            }
-            for open in &mut self.frames {
-                open.frame.render(&mut s, &mut self.fonts);
-            }
+            frame.render(&mut s, fonts);
         }
-
         if let (Some(pw_nz), Some(ph_nz)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) {
             surface.resize(pw_nz, ph_nz).expect("resize softbuffer surface");
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer");
             buffer.copy_from_slice(&physical);
             buffer.present().expect("present");
         }
+        let _ = window;
+    }
+
+    /// Creates a dialog window: its own OS window sized to the dialog,
+    /// centered over the main window (or the screen if the main is hidden),
+    /// like the original DialogBox().
+    #[allow(clippy::too_many_arguments)]
+    fn open_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        frame: Frame,
+        token: u64,
+        hides_main: bool,
+        ask: Option<Ask>,
+    ) {
+        let scale = self
+            .main
+            .as_ref()
+            .map(|m| m.window.scale_factor().round().max(1.0) as i32)
+            .unwrap_or(2);
+        let (lw, lh) = frame.window_size();
+        let mut attrs = Window::default_attributes()
+            .with_title("Tabboz Simulator")
+            .with_inner_size(winit::dpi::LogicalSize::new(lw as f64, lh as f64))
+            .with_resizable(false)
+            .with_decorations(false); // the BWCC chrome is drawn by the engine
+        // Center over the main window, like a modal dialog over its owner.
+        if let Some(m) = &self.main {
+            if let Ok(pos) = m.window.outer_position() {
+                let size = m.window.inner_size();
+                let logical = size.to_logical::<f64>(m.window.scale_factor());
+                let (dx, dy) = (
+                    ((logical.width - lw as f64) / 2.0).round() as i32,
+                    ((logical.height - lh as f64) / 2.0).round() as i32,
+                );
+                attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(
+                    pos.x + dx * scale,
+                    pos.y + dy * scale,
+                ));
+            }
+        }
+        let window = Arc::new(event_loop.create_window(attrs).expect("create dialog window"));
+        let ctx: softbuffer::Context<winit::event_loop::OwnedDisplayHandle> =
+            softbuffer::Context::new(event_loop.owned_display_handle()).expect("softbuffer context");
+        let surface = softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface");
+        let fonts = Fonts::new(scale);
+        let id = window.id();
+        let is_ask = ask.is_some();
+        self.dialogs.insert(
+            id,
+            WinCtx { last_mouse: (0, 0), window, surface, frame, fonts, scale, token, hides_main, ask },
+        );
+        // Modal semantics: while a game dialog or an ask window is open,
+        // only the top of the stack accepts input (DialogBox disables its
+        // owner); and the main window is hidden for game dialogs (SW_HIDE).
+        if is_ask {
+            self.modal = Some(id);
+        }
+        self.refresh_main_visibility();
+        self.redraw_dialog(id);
+    }
+
+    /// SW_HIDE / SW_SHOW of the original: the main window is hidden while
+    /// a game dialog is open.
+    fn refresh_main_visibility(&mut self) {
+        if let Some(m) = &self.main {
+            let hide = self.dialogs.values().any(|c| c.hides_main);
+            m.window.set_visible(!hide);
+        }
+    }
+
+    fn redraw_dialog(&mut self, id: WindowId) {
+        let Some(ctx) = self.dialogs.get_mut(&id) else { return };
+        Self::render_win(&ctx.window.clone(), &mut ctx.surface, &mut ctx.frame, &mut ctx.fonts, ctx.scale);
+    }
+
+    fn redraw_main(&mut self) {
+        let Some(m) = &mut self.main else { return };
+        Self::render_win(&m.window.clone(), &mut m.surface, &mut m.frame, &mut m.fonts, m.scale);
+    }
+
+    /// Closes a dialog window (by winit id): dropping the context destroys
+    /// the OS window.
+    fn close_dialog_id(&mut self, id: WindowId) {
+        if self.modal == Some(id) {
+            self.modal = None;
+        }
+        self.dialogs.remove(&id);
+        self.refresh_main_visibility();
+    }
+
+    /// Closes the dialog window carrying this game token.
+    fn close_dialog_token(&mut self, token: u64) {
+        let id = self
+            .dialogs
+            .iter()
+            .find(|(_, c)| c.token == token)
+            .map(|(id, _)| *id);
+        if let Some(id) = id {
+            self.close_dialog_id(id);
+        }
+    }
+
+    fn answer_and_close(&mut self, id: WindowId, answer: DialogAnswer) {
+        if let Some(ctx) = self.dialogs.remove(&id) {
+            if let Some(ask) = ctx.ask {
+                let _ = ask.reply.send(answer);
+            }
+        }
+        if self.modal == Some(id) {
+            self.modal = None;
+        }
+        self.refresh_main_visibility();
     }
 
     // ---- game requests ---------------------------------------------------
@@ -175,38 +239,47 @@ impl App {
                 for id in checks {
                     frame.check(id, true);
                 }
-                // layout() in redraw() centers the frame in the window.
                 // Game dialogs hide the main window (ShowWindow(WIN_PICCOLO));
                 // about/personal info/config/logo/spegnimi keep it visible.
-                self.frames.push(OpenFrame {
-                    frame,
-                    token,
-                    ask: None,
-                    hides_main: !keeps_main_visible(dlg_id),
-                });
+                let hides_main = !keeps_main_visible(dlg_id);
+                self.open_window(event_loop, frame, token, hides_main, None);
             }
             UiRequest::CloseFrame { token } => {
-                if let Some(pos) = self.frames.iter().rposition(|f| f.token == token) {
-                    self.frames.remove(pos);
-                }
+                self.close_dialog_token(token);
             }
             UiRequest::SetText { token, id, text } => {
-                if let Some(open) = self.frames.iter_mut().find(|f| f.token == token) {
-                    open.frame.set_text(id, text);
+                let win = self
+                    .dialogs
+                    .iter_mut()
+                    .find(|(_, c)| c.token == token)
+                    .map(|(_, c)| (c.frame.set_text(id, text), c.window.id()));
+                if let Some((_, id)) = win {
+                    self.redraw_dialog(id);
                 }
             }
             UiRequest::SetRadio { token, id } => {
-                if let Some(open) = self.frames.iter_mut().find(|f| f.token == token) {
-                    open.frame.check_radio(id);
+                let win = self
+                    .dialogs
+                    .iter_mut()
+                    .find(|(_, c)| c.token == token)
+                    .map(|(_, c)| (c.frame.check_radio(id), c.window.id()));
+                if let Some((_, id)) = win {
+                    self.redraw_dialog(id);
                 }
             }
             UiRequest::SetCheck { token, id, on } => {
-                if let Some(open) = self.frames.iter_mut().find(|f| f.token == token) {
-                    open.frame.check(id, on);
+                let win = self
+                    .dialogs
+                    .iter_mut()
+                    .find(|(_, c)| c.token == token)
+                    .map(|(_, c)| (c.frame.check(id, on), c.window.id()));
+                if let Some((_, id)) = win {
+                    self.redraw_dialog(id);
                 }
             }
             UiRequest::UpdateMain { snapshot } => {
                 self.apply_snapshot(snapshot);
+                self.redraw_main();
             }
             UiRequest::PlaySound { id } => {
                 if let Some(tx) = &self.sound_tx {
@@ -217,198 +290,51 @@ impl App {
                 event_loop.exit();
             }
             UiRequest::Ask { kind, reply } => {
-                let frame = match &kind {
+                let (frame, yes_no) = match &kind {
                     AskKind::Message { title, text } => {
-                        message_box(title, text, MsgBoxButtons::Ok)
+                        (message_box(title, text, MsgBoxButtons::Ok), false)
                     }
                     AskKind::Confirm { title, text } => {
-                        message_box(title, text, MsgBoxButtons::YesNo)
+                        (message_box(title, text, MsgBoxButtons::YesNo), true)
                     }
                     AskKind::Dialog { id, texts } => {
                         let mut f = Frame::new(*id);
                         for (cid, text) in texts {
                             f.set_text(*cid, text.clone());
                         }
-                        f
+                        (f, false)
                     }
                 };
-                let yes_no = matches!(kind, AskKind::Confirm { .. });
-                // Message boxes and event dialogs inherit the current mode:
-                // over the main window it stays visible, over a game dialog
-                // the teal desktop stays.
-                self.frames.push(OpenFrame {
-                    frame,
-                    token: 0,
-                    ask: Some(Ask { reply, yes_no }),
-                    hides_main: false,
-                });
+                self.open_window(event_loop, frame, 0, false, Some(Ask { reply, yes_no }));
             }
         }
-        self.redraw();
     }
 
     /// AggiornaPrincipale applied to the main frame controls.
     fn apply_snapshot(&mut self, s: MainSnapshot) {
-        let m = &mut self.main;
-        m.set_text(102, s.nome.clone());
-        m.set_text(105, s.soldi.clone());
-        m.set_text(151, s.fama.clone());
-        m.set_text(152, s.reputazione.clone());
-        m.set_text(153, s.studio.clone());
-        m.set_text(154, s.rapporti.clone());
-        m.set_text(155, s.nometipa.clone());
-        m.set_text(150, s.scooter_nome.clone());
-        m.set_text(156, s.scooter_stato.clone());
-        m.set_text(157, s.calendario.clone());
-        m.set_text(133, s.tipa_label.clone());
-        m.set_text(170, s.rapporto_label.clone());
-        m.set_tabboz_view(TabbozView {
+        let m = &mut match &mut self.main {
+            Some(m) => m,
+            None => return,
+        };
+        m.frame.set_text(102, s.nome.clone());
+        m.frame.set_text(105, s.soldi.clone());
+        m.frame.set_text(151, s.fama.clone());
+        m.frame.set_text(152, s.reputazione.clone());
+        m.frame.set_text(153, s.studio.clone());
+        m.frame.set_text(154, s.rapporti.clone());
+        m.frame.set_text(155, s.nometipa.clone());
+        m.frame.set_text(150, s.scooter_nome.clone());
+        m.frame.set_text(156, s.scooter_stato.clone());
+        m.frame.set_text(157, s.calendario.clone());
+        m.frame.set_text(133, s.tipa_label.clone());
+        m.frame.set_text(170, s.rapporto_label.clone());
+        m.frame.set_tabboz_view(TabbozView {
             sesso: s.tabboz.sesso,
             testa: s.tabboz.testa,
             giubbotto: s.tabboz.giubbotto,
             pantaloni: s.tabboz.pantaloni,
             scarpe: s.tabboz.scarpe,
         });
-        self.snapshot = Some(s);
-    }
-
-    // ---- mouse routing ---------------------------------------------------
-
-    /// True when (lx, ly) is on the title bar but not on a caption button:
-    /// dragging the frameless window from there, like a native title bar.
-    fn title_bar_drag_hit(frame: &Frame, lx: i32, ly: i32) -> bool {
-        let (fw, _) = frame.window_size();
-        let in_bar = (tabboz_win::theme::BORDER..tabboz_win::theme::BORDER + tabboz_win::theme::TITLE_H)
-            .contains(&ly)
-            && (tabboz_win::theme::BORDER..fw - tabboz_win::theme::BORDER).contains(&lx);
-        if !in_bar {
-            return false;
-        }
-        // Caption buttons sit on the right edge; clicks there are clicks.
-        let buttons_w = if frame.dialog_style() & 0x0002_0000 != 0 {
-            13 * 2 + 3
-        } else {
-            13
-        };
-        lx < fw - tabboz_win::theme::BORDER - buttons_w
-    }
-
-    fn handle_mouse(&mut self, event_loop: &ActiveEventLoop, action: MouseAction) {
-        // Mouse coordinates are PHYSICAL pixels; the engine is logical.
-        let scale = self.scale as f64;
-        let (lx, ly) = ((self.mouse.0 / scale) as i32, (self.mouse.1 / scale) as i32);
-
-        // Modals on top intercept everything.
-        let Some(top) = self.frames.last_mut() else {
-            // No modal: route to the main window (at its layout offset).
-            let (ox, oy) = self.main_offset;
-            let (lx, ly) = (lx - ox, ly - oy);
-            match action {
-                MouseAction::Move => {
-                    self.main.mouse_move(lx, ly, &mut self.fonts);
-                }
-                MouseAction::Down => {
-                    // Drag the frameless window from its title bar.
-                    if Self::title_bar_drag_hit(&self.main, lx, ly) {
-                        if let Some(w) = &self.window {
-                            let _ = w.drag_window();
-                        }
-                        return;
-                    }
-                    self.main.mouse_down(lx, ly, &mut self.fonts);
-                }
-                MouseAction::Up => {
-                    if let Some(ev) = self.main.mouse_up(lx, ly, &mut self.fonts) {
-                        self.on_main_event(event_loop, ev);
-                    }
-                }
-            }
-            self.redraw();
-            return;
-        };
-
-        // Local coordinates of the top frame: the offset is the one the
-        // layout computed (the same used by the renderer).
-        let (fx, fy) = top.frame.offset();
-        let (lx, ly) = (lx - fx, ly - fy);
-
-        let is_ask = top.ask.is_some();
-        let token = top.token;
-        match action {
-            MouseAction::Move => {
-                top.frame.mouse_move(lx, ly, &mut self.fonts);
-            }
-            MouseAction::Down => {
-                // Drag modal frames from their title bar too.
-                if Self::title_bar_drag_hit(&top.frame, lx, ly) {
-                    let window = self.window.clone();
-                    if let Some(w) = &window {
-                        let _ = w.drag_window();
-                    }
-                } else {
-                    top.frame.mouse_down(lx, ly, &mut self.fonts);
-                }
-            }
-            MouseAction::Up => {
-                if let Some(ev) = top.frame.mouse_up(lx, ly, &mut self.fonts) {
-                    // Click position relative to the clicked control
-                    // (BMPTipa palpatina coordinates).
-                    let pos = top.frame.take_last_click().unwrap_or((-1, -1));
-                    match (ev, is_ask) {
-                        (UiEvent::Button(id), true) => {
-                            let ask = self.frames.pop().and_then(|f| f.ask);
-                            if let Some(ask) = ask {
-                                let answer = match id {
-                                    6 => DialogAnswer::Yes, // IDYES
-                                    7 => DialogAnswer::No,  // IDNO
-                                    _ => DialogAnswer::Ok,
-                                };
-                                let _ = ask.reply.send(answer);
-                            }
-                        }
-                        (UiEvent::Button(id), false) => {
-                            let _ = self.send_game(GameAction::Button {
-                                token,
-                                id,
-                                x: pos.0,
-                                y: pos.1,
-                            });
-                        }
-                        (UiEvent::Command(_), _) => {}
-                        (UiEvent::Close, _) => {
-                            // Modal close button: answer the ask or close the
-                            // game dialog, like EndDialog.
-                            let ask = self.frames.pop().and_then(|f| f.ask);
-                            if let Some(ask) = ask {
-                                let answer =
-                                    if ask.yes_no { DialogAnswer::No } else { DialogAnswer::Ok };
-                                let _ = ask.reply.send(answer);
-                            } else if token != 0 {
-                                let _ = self.send_game(GameAction::FrameClosed { token });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.redraw();
-    }
-
-    fn on_main_event(&mut self, event_loop: &ActiveEventLoop, ev: UiEvent) {
-        match ev {
-            UiEvent::Button(id) => {
-                let pos = self.main.take_last_click().unwrap_or((-1, -1));
-                let _ = self.send_game(GameAction::Button { token: 0, id, x: pos.0, y: pos.1 });
-            }
-            UiEvent::Command(id) => {
-                let _ = self.send_game(GameAction::Command { id });
-            }
-            UiEvent::Close => {
-                // SC_CLOSE opens the Spegnimi dialog, like the original.
-                let _ = self.send_game(GameAction::Command { id: 108 });
-            }
-        }
-        let _ = event_loop;
     }
 
     fn send_game(&self, action: GameAction) -> bool {
@@ -419,8 +345,23 @@ impl App {
     }
 }
 
-fn self_size(f: &Frame) -> (i32, i32) {
-    f.window_size()
+/// True when (lx, ly) is on the title bar but not on a caption button:
+/// dragging the frameless window from there, like a native title bar.
+fn title_bar_drag_hit(frame: &Frame, lx: i32, ly: i32) -> bool {
+    let (fw, _) = frame.window_size();
+    let in_bar = (tabboz_win::theme::BORDER..tabboz_win::theme::BORDER + tabboz_win::theme::TITLE_H)
+        .contains(&ly)
+        && (tabboz_win::theme::BORDER..fw - tabboz_win::theme::BORDER).contains(&lx);
+    if !in_bar {
+        return false;
+    }
+    // Caption buttons sit on the right edge; clicks there are clicks.
+    let buttons_w = if frame.dialog_style() & 0x0002_0000 != 0 {
+        13 * 2 + 3
+    } else {
+        13
+    };
+    lx < fw - tabboz_win::theme::BORDER - buttons_w
 }
 
 /// Dialogs that the original opens WITHOUT hiding the main window
@@ -429,18 +370,14 @@ fn keeps_main_visible(dlg_id: u32) -> bool {
     matches!(dlg_id, 2 | 11 | 12 | 14 | 15 | 16) // About, PersonalInfo, Logo, Configuration, Format, Spegnimi
 }
 
-enum MouseAction {
-    Move,
-    Down,
-    Up,
-}
-
 impl ApplicationHandler<UiRequest> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Game + sound threads with their channels.
         let (game_tx, game_rx) = channel::<GameAction>();
         let (sound_tx, sound_rx) = channel::<u16>();
-        let proxy: EventLoopProxy<UiRequest> = self.proxy.clone().expect("proxy");
+        let proxy = self.proxy.clone().expect("proxy");
+        self.game_tx = Some(game_tx);
+        self.sound_tx = Some(sound_tx);
 
         // Boot the state: load the autosave, or start fresh (CaricaTutto).
         let (state, rng) = match save::load() {
@@ -458,12 +395,10 @@ impl ApplicationHandler<UiRequest> for App {
         });
         std::thread::spawn(move || sound::run(sound_rx));
 
-        self.game_tx = Some(game_tx);
-        self.sound_tx = Some(sound_tx);
-
-        // Start at the main window size + margin; layout() grows it when
-        // wider dialogs open.
-        let (lw, lh) = (self_size(&self.main).0 + 2 * Self::MARGIN, self_size(&self.main).1 + 2 * Self::MARGIN);
+        // Main window: exactly the size of the main dialog, like the
+        // original modeless main window.
+        let frame = Frame::new(1); // MAIN
+        let (lw, lh) = frame.window_size();
         let attrs = Window::default_attributes()
             .with_title("Tabboz Simulator")
             .with_inner_size(winit::dpi::LogicalSize::new(lw as f64, lh as f64))
@@ -473,65 +408,185 @@ impl ApplicationHandler<UiRequest> for App {
         let ctx: softbuffer::Context<winit::event_loop::OwnedDisplayHandle> =
             softbuffer::Context::new(event_loop.owned_display_handle()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer surface");
-        // Physical-resolution rendering needs the display scale.
-        self.scale = window.scale_factor().round().max(1.0) as i32;
-        self.fonts = Fonts::new(self.scale);
-        self.window = Some(window);
-        self.surface = Some(surface);
-        self.redraw();
+        let scale = window.scale_factor().round().max(1.0) as i32;
+        self.main = Some(MainWin {
+            last_mouse: (0, 0),
+            window,
+            surface,
+            frame,
+            fonts: Fonts::new(scale),
+            scale,
+        });
+        self.redraw_main();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, req: UiRequest) {
         self.handle_request(event_loop, req);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // ---- main window ---------------------------------------------------
+        if self.main.as_ref().map(|m| m.window.id()) == Some(id) {
+            // Modality: while a dialog is open, the original DialogBox has
+            // disabled its owner, so main-window input is ignored.
+            if !self.dialogs.is_empty() {
+                return;
+            }
+            let scale = self.main.as_ref().unwrap().scale as f64;
+            let Some(m) = &mut self.main else { return };
+            match event {
+                WindowEvent::CloseRequested => {
+                    let _ = self.send_game(GameAction::Command { id: 108 });
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    let (lx, ly) = ((position.x / scale) as i32, (position.y / scale) as i32);
+                    m.last_mouse = (lx, ly);
+                    m.frame.mouse_move(lx, ly, &mut m.fonts);
+                    self.redraw_main();
+                }
+                WindowEvent::CursorLeft { .. } => {
+                    m.frame.mouse_leave();
+                    self.redraw_main();
+                }
+                WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
+                    match state {
+                        winit::event::ElementState::Pressed => {
+                            if title_bar_drag_hit(&m.frame, m.last_mouse.0, m.last_mouse.1) {
+                                let _ = m.window.drag_window();
+                            } else {
+                                m.frame.mouse_down(m.last_mouse.0, m.last_mouse.1, &mut m.fonts);
+                            }
+                        }
+                        winit::event::ElementState::Released => {
+                            if let Some(ev) = m.frame.mouse_up(m.last_mouse.0, m.last_mouse.1, &mut m.fonts) {
+                                let pos = m.frame.take_last_click().unwrap_or((-1, -1));
+                                match ev {
+                                    UiEvent::Button(bid) => {
+                                        let _ = self.send_game(GameAction::Button {
+                                            token: 0,
+                                            id: bid,
+                                            x: pos.0,
+                                            y: pos.1,
+                                        });
+                                    }
+                                    UiEvent::Command(cid) => {
+                                        let _ = self.send_game(GameAction::Command { id: cid });
+                                    }
+                                    UiEvent::Close => {
+                                        // SC_CLOSE opens the Spegnimi dialog.
+                                        let _ = self.send_game(GameAction::Command { id: 108 });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.redraw_main();
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    let scale = m.window.scale_factor().round().max(1.0) as i32;
+                    m.scale = scale;
+                    m.fonts = Fonts::new(scale);
+                    self.redraw_main();
+                }
+                WindowEvent::RedrawRequested => {
+                    self.redraw_main();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // ---- dialog windows --------------------------------------------------
+        let Some(ctx) = self.dialogs.get_mut(&id) else { return };
+        // Modality: while an ask window is modal, other dialogs ignore input
+        // (the game thread is blocked waiting for the answer).
+        if let Some(modal) = self.modal {
+            if modal != id {
+                return;
+            }
+        }
+        let scale = ctx.scale as f64;
+        let token = ctx.token;
+        let is_ask = ctx.ask.is_some();
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self.send_game(GameAction::Command { id: 108 });
+                // The dialog close button: EndDialog / cancel answer.
+                if is_ask {
+                    let yes_no = ctx.ask.as_ref().map(|a| a.yes_no).unwrap_or(false);
+                    let answer = if yes_no { DialogAnswer::No } else { DialogAnswer::Ok };
+                    self.answer_and_close(id, answer);
+                } else {
+                    self.close_dialog_id(id);
+                    let _ = self.send_game(GameAction::FrameClosed { token });
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse = (position.x, position.y);
-                self.handle_mouse(event_loop, MouseAction::Move);
-            }
-            WindowEvent::CursorLeft { .. } => {
-                self.main.mouse_leave();
-                if let Some(top) = self.frames.last_mut() {
-                    let (mw, mh) = self_size(&self.main);
-                    let (fw, fh) = top.frame.window_size();
-                    let _ = (mw, mh, fw, fh);
-                }
-                self.redraw();
+                let (lx, ly) = ((position.x / scale) as i32, (position.y / scale) as i32);
+                ctx.last_mouse = (lx, ly);
+                ctx.frame.mouse_move(lx, ly, &mut ctx.fonts);
+                self.redraw_dialog(id);
             }
             WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
-                // self.mouse stays in PHYSICAL pixels; handle_mouse converts.
+                let (lx, ly) = ctx.last_mouse;
                 match state {
                     winit::event::ElementState::Pressed => {
-                        self.handle_mouse(event_loop, MouseAction::Down);
+                        if title_bar_drag_hit(&ctx.frame, lx, ly) {
+                            let window = ctx.window.clone();
+                            let _ = window.drag_window();
+                        } else {
+                            ctx.frame.mouse_down(lx, ly, &mut ctx.fonts);
+                        }
                     }
                     winit::event::ElementState::Released => {
-                        self.handle_mouse(event_loop, MouseAction::Up);
+                        if let Some(ev) = ctx.frame.mouse_up(lx, ly, &mut ctx.fonts) {
+                            let pos = ctx.frame.take_last_click().unwrap_or((-1, -1));
+                            match ev {
+                                UiEvent::Button(bid) => {
+                                    if is_ask {
+                                        let answer = match bid {
+                                            6 => DialogAnswer::Yes, // IDYES
+                                            7 => DialogAnswer::No,  // IDNO
+                                            _ => DialogAnswer::Ok,
+                                        };
+                                        self.answer_and_close(id, answer);
+                                    } else {
+                                        let _ = self.send_game(GameAction::Button {
+                                            token,
+                                            id: bid,
+                                            x: pos.0,
+                                            y: pos.1,
+                                        });
+                                    }
+                                }
+                                UiEvent::Close => {
+                                    if is_ask {
+                                        let yes_no = ctx.ask.as_ref().map(|a| a.yes_no).unwrap_or(false);
+                                        let answer = if yes_no { DialogAnswer::No } else { DialogAnswer::Ok };
+                                        self.answer_and_close(id, answer);
+                                    } else {
+                                        self.close_dialog_id(id);
+                                        let _ = self.send_game(GameAction::FrameClosed { token });
+                                    }
+                                }
+                                UiEvent::Command(_) => {}
+                            }
+                        }
                     }
                 }
+                self.redraw_dialog(id);
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                // The window moved between displays: re-rasterize the fonts.
-                let scale = self
-                    .window
-                    .as_ref()
-                    .map(|w| w.scale_factor().round().max(1.0) as i32)
-                    .unwrap_or(1);
-                if scale != self.scale {
-                    self.scale = scale;
-                    self.fonts = Fonts::new(scale);
-                }
-                self.redraw();
+                let scale = ctx.window.scale_factor().round().max(1.0) as i32;
+                ctx.scale = scale;
+                ctx.fonts = Fonts::new(scale);
+                self.redraw_dialog(id);
             }
             WindowEvent::RedrawRequested => {
-                self.redraw();
+                self.redraw_dialog(id);
             }
             _ => {}
         }
+        let _ = event_loop;
     }
 }
 
