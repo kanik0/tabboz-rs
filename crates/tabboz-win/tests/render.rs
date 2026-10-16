@@ -311,3 +311,26 @@ fn bau_house_renders_previews_and_wrapped_descriptions() {
         }
     }
 }
+
+#[test]
+fn message_box_text_stays_inside_the_body() {
+    // The Norme di utilizzo message: every synthesized line must fit the
+    // BODY control (x=14, w-26 DLU) so the template height matches what
+    // render_text draws - the old wrap limit (window width) made lines
+    // the render-time wrap had to re-break, clipping the last one.
+    let text = "Il biglietto e' valido solo dopo la convalida. Il biglietto deve essere conservato per tutta la durata del viaggio. Il diritto a viaggiare cessa al termine della tratta corrispondente al valore del biglietto. Il passeggero che al controllo non fosse in grado di presentare il biglietto o lo presentasse irriconoscibile, o comunque non valido, verra' abbattuto. La notifica del decesso verra' inviata ai parenti solo previo pagamento delle spese postali.";
+    let frame = message_box("Norme di utilizzo", text, MsgBoxButtons::Ok);
+    // Window width in DLU: px = DLU*2 + 4.
+    let (ww, _) = frame.window_size();
+    let w_dlu = (ww - 4) / 2;
+    let body_px = (w_dlu - 26) * 2;
+    let mut face = tabboz_win::font::Face::new(tabboz_win::fonts::FONT_REGULAR, 1);
+    for c in frame.dlg().controls.iter().filter(|c| c.id < -9) {
+        let tw = face.text_width(c.text);
+        assert!(
+            tw <= body_px,
+            "line of {tw}px wider than body {body_px}px: {:?}",
+            c.text
+        );
+    }
+}

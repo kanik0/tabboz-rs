@@ -911,13 +911,16 @@ pub fn message_box(title: &str, text: &str, buttons: MsgBoxButtons) -> Frame {
         // character, and word-wrap long lines (Norme di utilizzo, the
         // Progresso joke, ...) so they never overflow the window.
         let mut face = crate::font::Face::new(crate::fonts::FONT_REGULAR, 1);
-        const MAX_W_PX: i32 = 320; // the old 160-DLU clamp
+        // Wrap to the BODY width: the text control is x=14, w-26 DLU, so a
+        // 160-DLU-clamped box gives (160-26)*2 = 268 px of usable width —
+        // wrapping to the window width would still overflow the body.
+        const BODY_W_PX: i32 = (160 - 26) * 2;
         let mut lines: Vec<String> = Vec::new();
         for para in text.split('\n') {
             let mut cur = String::new();
             for word in para.split(' ') {
                 let candidate = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
-                if !cur.is_empty() && face.text_width(&candidate) > MAX_W_PX {
+                if !cur.is_empty() && face.text_width(&candidate) > BODY_W_PX {
                     lines.push(std::mem::take(&mut cur));
                     cur = word.to_string();
                 } else {
@@ -927,7 +930,9 @@ pub fn message_box(title: &str, text: &str, buttons: MsgBoxButtons) -> Frame {
             lines.push(cur);
         }
         let longest = lines.iter().map(|l| face.text_width(l)).max().unwrap_or(10);
-        let w = ((longest + 70) / 2).clamp(90, 160);
+        // Body = w-26 DLU must hold the longest wrapped line, with the
+        // text control starting at x=14 DLU (12 DLU right margin).
+        let w = ((longest + 1) / 2 + 26).clamp(90, 160);
         let h = (lines.len() as i32 * 13 + 60) / 2 + 6;
 
         let leak = |s: &str| -> &'static str { Box::leak(s.to_string().into_boxed_str()) };
