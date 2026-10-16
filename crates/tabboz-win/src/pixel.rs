@@ -92,7 +92,8 @@ impl<'a> Surface<'a> {
         self.rect_phys(x * s, y * s, w * s, h * s, c);
     }
 
-    fn rect_phys(&mut self, x: i32, y: i32, w: i32, h: i32, c: Pixel) {
+    /// Raw physical-coordinate rectangle (font stamp and present only).
+    pub fn rect_phys(&mut self, x: i32, y: i32, w: i32, h: i32, c: Pixel) {
         let (pw, ph) = self.physical_size();
         let (x0, y0) = (x.max(0), y.max(0));
         let (x1, y1) = ((x + w).min(pw), (y + h).min(ph));

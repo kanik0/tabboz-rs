@@ -32,6 +32,9 @@ struct OpenFrame {
     token: u64,
     /// Blocking request being answered by this frame, if any.
     ask: Option<Ask>,
+    /// Like the original ShowWindow(WIN_PICCOLO = SW_HIDE): game dialogs
+    /// hide the main window, that stays up for about/personal info/config.
+    hides_main: bool,
 }
 
 struct Ask {
@@ -96,7 +99,15 @@ impl App {
         let mut physical = vec![0u32; (pw * ph) as usize];
         {
             let mut s = Surface::new(&mut physical, lw, lh, scale);
-            self.main.render(&mut s, &mut self.fonts);
+            // Desktop mode: game dialogs hide the main window (like the
+            // original SW_HIDE) and float on the teal desktop of the web
+            // port; otherwise the main window stays and modals stack on it.
+            let desktop = self.frames.iter().any(|f| f.hides_main);
+            if desktop {
+                s.fill(tabboz_win::theme::TEAL);
+            } else {
+                self.main.render(&mut s, &mut self.fonts);
+            }
             for open in &mut self.frames {
                 open.frame.render(&mut s, &mut self.fonts);
             }
@@ -127,7 +138,14 @@ impl App {
                 }
                 let (ox, oy) = self.center_offset(&frame);
                 frame.set_offset(ox, oy);
-                self.frames.push(OpenFrame { frame, token, ask: None });
+                // Game dialogs hide the main window (ShowWindow(WIN_PICCOLO));
+                // about/personal info/config/logo/spegnimi keep it visible.
+                self.frames.push(OpenFrame {
+                    frame,
+                    token,
+                    ask: None,
+                    hides_main: !keeps_main_visible(dlg_id),
+                });
             }
             UiRequest::CloseFrame { token } => {
                 if let Some(pos) = self.frames.iter().rposition(|f| f.token == token) {
@@ -179,10 +197,14 @@ impl App {
                 let yes_no = matches!(kind, AskKind::Confirm { .. });
                 let (ox, oy) = self.center_offset(&frame);
                 frame.set_offset(ox, oy);
+                // Message boxes and event dialogs inherit the current mode:
+                // over the main window it stays visible, over a game dialog
+                // the teal desktop stays.
                 self.frames.push(OpenFrame {
                     frame,
                     token: 0,
                     ask: Some(Ask { reply, yes_no }),
+                    hides_main: false,
                 });
             }
         }
@@ -362,6 +384,12 @@ impl App {
 
 fn self_size(f: &Frame) -> (i32, i32) {
     f.window_size()
+}
+
+/// Dialogs that the original opens WITHOUT hiding the main window
+/// (no ShowWindow(WIN_PICCOLO) call in WM_COMMAND).
+fn keeps_main_visible(dlg_id: u32) -> bool {
+    matches!(dlg_id, 2 | 11 | 12 | 14 | 15 | 16) // About, PersonalInfo, Logo, Configuration, Format, Spegnimi
 }
 
 enum MouseAction {
