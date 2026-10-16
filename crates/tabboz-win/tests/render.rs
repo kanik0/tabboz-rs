@@ -124,3 +124,31 @@ fn clicking_face_does_nothing() {
     let ev = frame.mouse_up(200, 200, &mut fonts);
     assert_eq!(ev, None);
 }
+
+#[test]
+fn empty_ok_cancel_buttons_render_their_bwcc_bitmaps() {
+    // The .rc templates carry empty-text BorBtn for OK (id 1) and Cancel
+    // (id 2): BWCC draws their faces from the chrome bitmaps 1001/1002,
+    // exactly like the web port does with CSS backgrounds.
+    let mut frame = Frame::new(7); // Scooter: has an empty id-1 BorBtn
+    let mut fonts = Fonts::new(1);
+    let (w, h) = frame.window_size();
+    let mut buf = vec![0u32; (w * h) as usize];
+    {
+        let mut s = Surface::new(&mut buf, w, h, 1);
+        frame.render(&mut s, &mut fonts);
+    }
+    let get = |x: i32, y: i32| buf[(y * w + x) as usize];
+    // The OK button: CONTROL "", 1, "BorBtn", ..., 105, 72, 33, 21
+    // client origin (2, 22): button at (212, 166) size 66x42. The bitmap
+    // face (silver with dark border) must be there, not an empty face box.
+    let mut ink = 0;
+    for y in 168..204 {
+        for x in 214..278 {
+            if get(x, y) != tabboz_win::theme::FACE {
+                ink += 1;
+            }
+        }
+    }
+    assert!(ink > 300, "OK bitmap button not drawn: {ink} ink pixels");
+}

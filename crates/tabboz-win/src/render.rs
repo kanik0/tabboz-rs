@@ -539,6 +539,16 @@ impl Frame {
         self.state.cache.get(name).cloned()
     }
 
+    /// Chrome bitmap (novantotto/: OK/Cancel faces, glyphs) by name.
+    fn cached_chrome(&mut self, name: &str) -> Option<Image> {
+        if !self.state.cache.contains_key(name) {
+            let a = crate::assets::CHROME_BITMAPS.iter().find(|a| a.name == name)?;
+            let img = img::decode_bmp(a.data).ok()?;
+            self.state.cache.insert(name.to_string(), img);
+        }
+        self.state.cache.get(name).cloned()
+    }
+
     fn composed_tabboz(&mut self) -> Image {
         if self.state.composed.is_none() {
             self.state.composed = Some(self.tabboz.compose());
@@ -600,6 +610,19 @@ impl Frame {
         }
         match c.kind {
             ControlKind::Button | ControlKind::BorBtn => {
+                // BWCC bitmap buttons: the .rc templates carry empty-text
+                // BorBtn for OK (id 1) and Cancel (id 2); the button faces
+                // are the chrome bitmaps 1001/1002 (the web port does the
+                // same with CSS backgrounds).
+                let text = self.text(c);
+                if c.kind == ControlKind::BorBtn && text.is_empty() && matches!(c.id, 1 | 2) {
+                    let bmp = if c.id == 1 { "1001" } else { "1002" };
+                    if let Some(img) = self.cached_chrome(bmp) {
+                        let (ox, oy) = ((w - img.w) / 2, (h - img.h) / 2);
+                        surf.blit(&img, x + ox, y + oy);
+                    }
+                    return;
+                }
                 let pressed = self.state.pressed_control == Some(idx);
                 self.render_button(surf, fonts, c, x, y, w, h, pressed);
             }
