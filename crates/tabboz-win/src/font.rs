@@ -1,11 +1,13 @@
 // Text rendering with the bundled MS Sans Serif fonts.
 //
-// The web port ships MS Sans Serif as WOFF; the build script converts it to
-// TTF and embeds it (see build.rs). The font is designed on an 11px pixel
-// grid, so every glyph is rasterized at TEXT_SIZE with BINARY coverage
-// (no antialiasing, exactly like the bitmap font of the original) and then
-// each ink pixel is expanded into a scale x scale physical block. This is
-// pixel-perfect at any scale: the same hard edges the original Win95 had.
+// The bundled ms_sans_serif.woff is 98.css "Pixelated MS Sans Serif": the
+// outlines are traced from the original bitmap but the shapes sit half a
+// pixel off-grid, and ab_glyph (like macOS CoreText in browsers) does not
+// run TrueType hinting. The faithful rendering is therefore the same the
+// web port shows in a browser: grayscale antialiasing at the physical
+// resolution, with glyphs rasterized at TEXT_SIZE * scale on integer
+// positions. A contrast curve deepens the strokes and removes the
+// fringe, which keeps the text as crisp as the design allows.
 
 use ab_glyph::{Font, FontArc, Glyph, PxScale, PxScaleFont, ScaleFont, point};
 use std::collections::HashMap;
@@ -15,34 +17,41 @@ use crate::pixel::{Pixel, Surface};
 /// Logical text size of the original dialogs (MS Sans Serif 10pt @96dpi).
 pub const TEXT_SIZE: f32 = 11.0;
 
+/// Contrast curve calibrated on this font: the outlines sit half a pixel
+/// off-grid, so true strokes carry ~0.45-0.75 coverage while the fringe
+/// stays below ~0.2. The curve maps 0.5+ to full ink, keeps a soft ramp
+/// for curved edges (0.2-0.5) and drops the fringe entirely (<0.1).
+fn contrast(c: f32) -> u8 {
+    (((c - 0.1) / 0.4).clamp(0.0, 1.0) * 255.0) as u8
+}
+
 pub struct Face {
     font: PxScaleFont<FontArc>,
     cache: HashMap<char, CachedGlyph>,
-    /// Integer upscale factor applied to the rasterized glyphs.
+    /// Integer upscale factor: glyphs are rasterized at TEXT_SIZE * scale.
     scale: i32,
-    /// Ascent/descent at the design size (logical pixels).
+    /// Ascent/descent at the rasterization size (physical pixels).
     ascent: f32,
     descent: f32,
 }
 
-#[derive(Clone)]
 struct CachedGlyph {
-    /// Binary coverage (0 or 255) on the 11px design grid.
+    /// Alpha coverage after the contrast curve, w*h (physical pixels).
     bitmap: Vec<u8>,
     w: i32,
     h: i32,
-    /// Offset of the bitmap top-left from the glyph origin (design ints).
+    /// Offset of the bitmap top-left from the glyph origin (physical ints).
     x: i32,
     y: i32,
-    /// Advance to the next character (design pixels).
+    /// Advance to the next character (physical pixels).
     advance: f32,
 }
 
 impl Face {
     pub fn new(data: &[u8], scale: i32) -> Self {
         let font = FontArc::try_from_vec(data.to_vec()).expect("valid font");
-        // Rasterize at the DESIGN size: the font is pixel-perfect there.
-        let scaled: PxScaleFont<FontArc> = font.into_scaled(PxScale::from(TEXT_SIZE));
+        let size = TEXT_SIZE * scale as f32;
+        let scaled: PxScaleFont<FontArc> = font.into_scaled(PxScale::from(size));
         let ascent = scaled.ascent();
         let descent = scaled.descent();
         Face {
@@ -54,9 +63,9 @@ impl Face {
         }
     }
 
-    /// Logical line height.
+    /// Logical line height (matches the original dialog text rows).
     pub fn line_height(&self) -> i32 {
-        (self.ascent - self.descent).ceil() as i32
+        ((self.ascent - self.descent) / self.scale as f32).ceil() as i32
     }
 
     fn glyph(&mut self, c: char) -> &CachedGlyph {
@@ -64,6 +73,9 @@ impl Face {
         self.cache.entry(c).or_insert_with(|| {
             let glyph_id = font.glyph_id(c);
             let advance = font.h_advance(glyph_id);
+            // Rasterize at the origin on the physical grid; the draw
+            // position snaps to integers so every glyph lands where the
+            // grid expects it.
             let glyph = Glyph {
                 id: glyph_id,
                 scale: font.scale,
@@ -74,12 +86,9 @@ impl Face {
                 let w = bb.width().ceil() as i32;
                 let h = bb.height().ceil() as i32;
                 let mut bitmap = vec![0u8; (w * h).max(0) as usize];
-                // Binary coverage on the design grid: MS Sans Serif is a
-                // bitmap-styled font and Win95 rendered it without any
-                // antialiasing.
                 outlined.draw(|x, y, coverage| {
                     if x < w as u32 && y < h as u32 {
-                        bitmap[(y * w as u32 + x) as usize] = if coverage >= 0.40 { 255 } else { 0 };
+                        bitmap[(y * w as u32 + x) as usize] = contrast(coverage);
                     }
                 });
                 CachedGlyph {
@@ -102,17 +111,16 @@ impl Face {
         for c in s.chars() {
             x += self.glyph(c).advance;
         }
-        x.ceil() as i32
+        (x / self.scale as f32).ceil() as i32
     }
 
-    /// Draws one glyph's ink, expanding every design pixel to a
-    /// scale x scale physical block (pixel-perfect upscaling).
+    /// Draws one glyph's ink with alpha blending (physical coordinates).
     fn stamp(&self, surf: &mut Surface, g: &CachedGlyph, gx: i32, gy: i32, color: Pixel) {
-        let s = self.scale;
         for yy in 0..g.h {
             for xx in 0..g.w {
-                if g.bitmap[(yy * g.w + xx) as usize] > 0 {
-                    surf.rect_phys((gx + xx) * s, (gy + yy) * s, s, s, color);
+                let a = g.bitmap[(yy * g.w + xx) as usize];
+                if a > 0 {
+                    surf.blend_phys(gx + xx, gy + yy, color, a);
                 }
             }
         }
@@ -120,13 +128,19 @@ impl Face {
 
     /// Draws a single line at a LOGICAL (x = left, y = top) position.
     fn draw_line(&mut self, surf: &mut Surface, s: &str, x: i32, y: i32, color: Pixel) {
-        let baseline = y + self.ascent.round() as i32;
-        let mut pen = x;
+        let scale = self.scale;
+        let baseline = y * scale + self.ascent.round() as i32;
+        let mut pen = x * scale;
         for c in s.chars() {
-            let g = self.glyph(c).clone();
-            self.stamp(surf, &g, pen + g.x, baseline + g.y, color);
-            // Snap the pen to the design grid: no subpixel accumulation.
-            pen = (pen as f32 + g.advance).round() as i32;
+            // Copy what stamp needs so self is free again.
+            let (bitmap, w, h, gx, gy, advance) = {
+                let g = self.glyph(c);
+                (g.bitmap.clone(), g.w, g.h, pen + g.x, baseline + g.y, g.advance)
+            };
+            let g = CachedGlyph { bitmap, w, h, x: 0, y: 0, advance };
+            self.stamp(surf, &g, gx, gy, color);
+            // Snap the pen to the physical grid: no subpixel drift.
+            pen = (pen as f32 + advance).round() as i32;
         }
     }
 
@@ -136,8 +150,9 @@ impl Face {
 
     /// Draws text underlining the character after '&' (Windows accelerators).
     pub fn draw_accel_text(&mut self, surf: &mut Surface, s: &str, x: i32, y: i32, color: Pixel) {
-        let baseline = y + self.ascent.round() as i32;
-        let mut pen = x;
+        let scale = self.scale;
+        let baseline = y * scale + self.ascent.round() as i32;
+        let mut pen = x * scale;
         let mut chars = s.chars().peekable();
         let mut underline_next = false;
         while let Some(c) = chars.next() {
@@ -149,14 +164,18 @@ impl Face {
                     continue;
                 }
             }
-            let g = self.glyph(c).clone();
-            self.stamp(surf, &g, pen + g.x, baseline + g.y, color);
+            let (bitmap, w, h, gx, gy, advance) = {
+                let g = self.glyph(c);
+                (g.bitmap.clone(), g.w, g.h, pen + g.x, baseline + g.y, g.advance)
+            };
+            let g = CachedGlyph { bitmap, w, h, x: 0, y: 0, advance };
+            self.stamp(surf, &g, gx, gy, color);
             if underline_next {
-                let uw = g.advance.round() as i32;
-                surf.rect(pen, baseline + 1, uw.max(1), 1, color);
+                let uw = advance.round() as i32;
+                surf.rect((pen / scale).max(0), baseline / scale, (uw / scale).max(1), 1, color);
                 underline_next = false;
             }
-            pen = (pen as f32 + g.advance).round() as i32;
+            pen = (pen as f32 + advance).round() as i32;
         }
     }
 }
@@ -188,14 +207,22 @@ impl Default for Fonts {
 mod tests {
     use super::*;
 
+    fn render(text: &str, scale: i32) -> (Vec<u32>, i32, i32) {
+        let mut f = Fonts::new(scale);
+        let w = f.regular.text_width(text);
+        let h = 20;
+        let mut buf = vec![0xFFFFFFu32; (w as usize * scale as usize) * (h as usize * scale as usize)];
+        let mut s = Surface::new(&mut buf, w, h, scale);
+        f.regular.draw_text(&mut s, text, 0, 3, 0x000000);
+        (buf, w, h)
+    }
+
     #[test]
     fn fonts_load_and_measure() {
         let mut f = Fonts::new(1);
         let w = f.regular.text_width("Tabboz Simulator");
         assert!(w > 50, "title text suspiciously narrow: {w}");
-        let mut buf = vec![0xFFFFFFu32; w as usize * 20];
-        let mut s = Surface::new(&mut buf, w, 20, 1);
-        f.regular.draw_text(&mut s, "Tabboz Simulator", 0, 3, 0x000000);
+        let (buf, _, _) = render("Tabboz Simulator", 1);
         assert!(buf.iter().any(|p| *p != 0xFFFFFF), "no pixels drawn");
     }
 
@@ -208,64 +235,45 @@ mod tests {
         assert!(buf.iter().any(|p| *p != 0xFFFFFF));
     }
 
-    /// Crispness contract: glyphs are rasterized with binary coverage on
-    /// the design grid and upscaled in exact blocks, so the ink contains
-    /// NO partial (antialiased) pixels at any scale.
+    /// The strokes must be dark: the contrast curve has to keep the core
+    /// of every glyph near full ink, or the text reads as washed out.
     #[test]
-    fn text_is_pixel_perfect_at_scale_2() {
+    fn strokes_are_dark() {
         for scale in [1, 2] {
-            let mut f = Fonts::new(scale);
-            let w = f.regular.text_width("Testo nitido");
-            let mut buf = vec![0xFFFFFFu32; (w as usize * scale as usize) * (20 * scale as usize)];
-            let mut s = Surface::new(&mut buf, w, 20, scale);
-            f.regular.draw_text(&mut s, "Testo nitido", 0, 3, 0x000000);
-
+            let (buf, _, _) = render("Profitto scolastico", scale);
             let mut ink = 0usize;
-            let mut partial = 0usize;
-            for p in buf.iter() {
+            let mut dark = 0usize;
+            for p in &buf {
                 if *p != 0xFFFFFF {
                     ink += 1;
-                    // Any value that is neither the exact text color nor
-                    // the exact background is an antialiasing artifact.
-                    if *p != 0x000000 {
-                        partial += 1;
+                    let r = (*p >> 16) & 0xFF;
+                    if r < 80 {
+                        dark += 1;
                     }
                 }
             }
-            assert!(ink > 40 * (scale as usize * scale as usize), "too little ink at scale {scale}: {ink}");
-            assert_eq!(
-                partial, 0,
-                "antialiased pixels found at scale {scale}: {partial} of {ink}"
+            assert!(ink > 100 * scale as usize, "too little ink: {ink}");
+            let ratio = dark as f32 / ink as f32;
+            assert!(
+                ratio > 0.5,
+                "strokes look washed out at scale {scale}: {dark}/{ink} dark"
             );
         }
     }
 
-    /// The scale-2 rendering must contain every scale-1 ink pixel expanded
-    /// to a 2x2 block: same shape, pixel-doubled.
+    /// The fringe must be gone: the lightest text pixels are still clearly
+    /// darker than the background (no 1-off faint halos).
     #[test]
-    fn scale_2_is_exact_2x_of_scale_1() {
-        let mut f1 = Fonts::new(1);
-        let mut f2 = Fonts::new(2);
-        let text = "Tabboz";
-        let w = f1.regular.text_width(text);
-        let mut buf1 = vec![0xFFFFFFu32; (w as usize) * 20];
-        let mut s1 = Surface::new(&mut buf1, w, 20, 1);
-        f1.regular.draw_text(&mut s1, text, 0, 3, 0x000000);
-        let mut buf2 = vec![0xFFFFFFu32; (w as usize * 2) * 40];
-        let mut s2 = Surface::new(&mut buf2, w, 20, 2);
-        f2.regular.draw_text(&mut s2, text, 0, 3, 0x000000);
-
-        for y in 0..20 {
-            for x in 0..w {
-                let expected = buf1[(y * w + x) as usize];
-                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                    let got = buf2[((2 * y + dy) * 2 * w + 2 * x + dx) as usize];
-                    assert_eq!(
-                        got, expected,
-                        "pixel ({x},{y}) not doubled correctly at scale 2"
-                    );
-                }
-            }
-        }
+    fn fringe_is_removed() {
+        let (buf, _, _) = render("Scooter", 1);
+        let faint = buf
+            .iter()
+            .filter(|p| **p != 0xFFFFFF && (**p >> 16) & 0xFF > 170)
+            .count();
+        let ink = buf.iter().filter(|p| **p != 0xFFFFFF).count();
+        assert!(
+            (faint as f32 / ink as f32) < 0.3,
+            "too much faint fringe: {faint} of {ink}"
+        );
     }
 }
