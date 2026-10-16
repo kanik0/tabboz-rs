@@ -67,7 +67,7 @@ pub enum GameAction {
     /// A menu bar command (main window only).
     Command { id: u16 },
     /// The frame was closed (close button / OK / Cancel).
-    FrameClosed { token: u64 },
+    FrameClosed { token: u64, edits: Vec<(i32, String)> },
 }
 
 /// Snapshot of everything the main window renders.

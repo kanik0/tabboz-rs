@@ -195,13 +195,47 @@ impl Game {
     /// Runs until the app quits.
     pub fn run(&mut self) {
         self.update_main();
+        self.boot_logo();
         while let Ok(action) = self.rx.recv() {
             match action {
                 GameAction::Button { token, id, x, y } => self.on_button(token, id, x, y),
                 GameAction::Command { id } => self.on_menu(id),
-                GameAction::FrameClosed { token } => self.on_closed(token),
+                GameAction::FrameClosed { token, edits } => self.on_closed(token, &edits),
             }
         }
+    }
+
+    /// STARTcmdShow: the original shows the Logo dialog for 10 seconds at
+    /// every startup (WM_INITDIALOG SetTimer(10000), fase_di_avvio = 1);
+    /// its button (id 202) ends it early (KillTimer + EndDialog).
+    fn boot_logo(&mut self) {
+        let t = self.token(Handler::Logo);
+        let _ = self.bridge.tx.send_event(UiRequest::ShowFrame {
+            token: t,
+            dlg_id: 12,
+            texts: vec![],
+            radios: vec![],
+            checks: vec![],
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            if remaining.is_zero() {
+                break;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(GameAction::Button { token, id, x, y }) if token == t => {
+                    self.on_button(t, id, x, y); // logo click: close early
+                    return;
+                }
+                Ok(GameAction::FrameClosed { token, .. }) if token == t => {
+                    self.on_closed(t, &[]);
+                    return;
+                }
+                Ok(_) => {} // nothing else can happen while the logo is up
+                Err(_) => break, // 10 seconds elapsed
+            }
+        }
+        self.close(t);
     }
 
     // ---- helpers ----------------------------------------------------------
@@ -555,7 +589,23 @@ impl Game {
         }
     }
 
-    fn on_closed(&mut self, token: u64) {
+    fn on_closed(&mut self, token: u64, edits: &[(i32, String)]) {
+        if self.handler_of(token) == Some(Handler::PersonalInfo) {
+            // The original reads the edit fields with GetDlgItemText:
+            // 101 Cognome, 102 Nome, 105 City, 107 Street, 111 Residenza.
+            for (id, text) in edits {
+                match *id {
+                    101 => self.state.cognome = text.clone(),
+                    102 => self.state.nome = text.clone(),
+                    105 => self.state.city = text.clone(),
+                    107 => self.state.street = text.clone(),
+                    111 => self.state.residenza = text.clone(),
+                    _ => {}
+                }
+            }
+            crate::save::save(&self.state);
+            self.update_main();
+        }
         // The dialog close button (X) is IDCANCEL in the original: it only
         // ends the dialog, never the application (Spegnimi included).
         self.close(token);

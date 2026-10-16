@@ -434,7 +434,11 @@ impl ApplicationHandler<UiRequest> for App {
             .with_title("Tabboz Simulator")
             .with_inner_size(winit::dpi::LogicalSize::new(lw as f64, lh as f64))
             .with_resizable(false)
-            .with_decorations(false); // the BWCC chrome is drawn by the engine
+            .with_decorations(false) // the BWCC chrome is drawn by the engine
+            // Hidden at boot: the startup Logo shows first (the original
+            // opens it before the main dialog); refresh_main_visibility()
+            // reveals the main when the last dialog closes.
+            .with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let ctx: softbuffer::Context<winit::event_loop::OwnedDisplayHandle> =
             softbuffer::Context::new(event_loop.owned_display_handle()).expect("softbuffer context");
@@ -507,6 +511,9 @@ impl ApplicationHandler<UiRequest> for App {
                                         // SC_CLOSE opens the Spegnimi dialog.
                                         let _ = self.send_game(GameAction::Command { id: 108 });
                                     }
+                                    UiEvent::Minimize => {
+                                        m.window.set_minimized(true);
+                                    }
                                 }
                             }
                         }
@@ -547,8 +554,9 @@ impl ApplicationHandler<UiRequest> for App {
                     let answer = if yes_no { DialogAnswer::No } else { DialogAnswer::Ok };
                     self.answer_and_close(id, answer);
                 } else {
+                    let edits = ctx.frame.edit_texts();
                     self.close_dialog_id(id);
-                    let _ = self.send_game(GameAction::FrameClosed { token });
+                    let _ = self.send_game(GameAction::FrameClosed { token, edits });
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -595,16 +603,39 @@ impl ApplicationHandler<UiRequest> for App {
                                         let answer = if yes_no { DialogAnswer::No } else { DialogAnswer::Ok };
                                         self.answer_and_close(id, answer);
                                     } else {
+                                        let edits = ctx.frame.edit_texts();
                                         self.close_dialog_id(id);
-                                        let _ = self.send_game(GameAction::FrameClosed { token });
+                                        let _ = self.send_game(GameAction::FrameClosed { token, edits });
                                     }
                                 }
                                 UiEvent::Command(_) => {}
+                                UiEvent::Minimize => {}
                             }
                         }
                     }
                 }
                 self.redraw_dialog(id);
+            }
+            // Keyboard input into the focused edit (Personal Information
+            // fields); Enter/Escape are the dialog IDOK/IDCANCEL.
+            WindowEvent::KeyboardInput { event, .. } => {
+                let named = |n| event.logical_key == winit::keyboard::Key::Named(n);
+                if ctx.frame.has_edit_focus()
+                    && (named(winit::keyboard::NamedKey::Enter)
+                        || named(winit::keyboard::NamedKey::Escape))
+                {
+                    let edits = ctx.frame.edit_texts();
+                    self.close_dialog_id(id);
+                    let _ = self.send_game(GameAction::FrameClosed { token, edits });
+                } else if named(winit::keyboard::NamedKey::Backspace) {
+                    ctx.frame.backspace();
+                    self.redraw_dialog(id);
+                } else if let Some(text) = event.text.as_ref() {
+                    for c in text.chars() {
+                        ctx.frame.type_char(c);
+                    }
+                    self.redraw_dialog(id);
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 let scale = ctx.window.scale_factor().round().max(1.0) as i32;

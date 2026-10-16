@@ -108,6 +108,8 @@ pub enum UiEvent {
     Button(i32),
     /// The window close button.
     Close,
+    /// The minimize button (main window, WS_MINIMIZEBOX).
+    Minimize,
 }
 
 pub struct Frame {
@@ -124,6 +126,9 @@ struct FrameState {
     open_menu: Option<usize>,    // popup whose dropdown is open
     hover_menu_item: Option<usize>,
     pressed_sys_close: bool,
+    pressed_sys_min: bool,
+    /// The Edit control that owns the keyboard focus (caret).
+    focused_edit: Option<usize>,
     /// Decoded-image cache keyed by asset name.
     cache: HashMap<String, Image>,
     /// Composed tabboz (recomputed when the view changes).
@@ -205,6 +210,44 @@ impl Frame {
     /// The dialog template this frame renders.
     pub fn dlg(&self) -> &'static Dialog {
         self.dlg
+    }
+
+    /// Whether an edit of this frame owns the keyboard focus.
+    pub fn has_edit_focus(&self) -> bool {
+        self.state.focused_edit.is_some()
+    }
+
+    /// ES_AUTOHSCROLL input: appends a character to the focused edit.
+    pub fn type_char(&mut self, c: char) {
+        let Some(idx) = self.state.focused_edit else { return };
+        let id = self.dlg.controls[idx].id;
+        let cur = self.state.text.get(&id).cloned().unwrap_or_else(|| self.dlg.controls[idx].text.to_string());
+        if c >= ' ' && cur.chars().count() < 64 {
+            let mut s = cur;
+            s.push(c);
+            self.set_text(id, s);
+        }
+    }
+
+    /// Backspace into the focused edit.
+    pub fn backspace(&mut self) {
+        let Some(idx) = self.state.focused_edit else { return };
+        let id = self.dlg.controls[idx].id;
+        let mut cur = self.state.text.get(&id).cloned().unwrap_or_else(|| self.dlg.controls[idx].text.to_string());
+        if cur.pop().is_some() {
+            self.set_text(id, cur);
+        }
+    }
+
+    /// All edit fields with their current text (the game reads them when
+    /// the dialog closes, like the original GetDlgItemText calls).
+    pub fn edit_texts(&self) -> Vec<(i32, String)> {
+        self.dlg
+            .controls
+            .iter()
+            .filter(|c| c.kind == ControlKind::Edit)
+            .map(|c| (c.id, self.text(c).to_string()))
+            .collect()
     }
 
     /// Position of this frame inside the window surface (modal dialogs).
@@ -412,15 +455,37 @@ impl Frame {
             self.state.pressed_sys_close = true;
             return true;
         }
+        // Minimize button (WS_MINIMIZEBOX).
+        if self.dlg.style & 0x0002_0000 != 0 {
+            let (mx, my, mw, mh) = sys_button_rect(BORDER + ww - 2 * BORDER - 13 - 17 - 2, BORDER + 2);
+            if x >= mx && x < mx + mw && y >= my && y < my + mh {
+                self.state.pressed_sys_min = true;
+                return true;
+            }
+        }
         // Dialog controls.
         if let Some(idx) = self.hit_test(x, y, fonts) {
             self.state.pressed_control = Some(idx);
+            // Clicking an edit gives it the keyboard focus; anything else
+            // takes the focus away (Win95 single-focus dialogs).
+            self.state.focused_edit =
+                if self.dlg.controls[idx].kind == ControlKind::Edit { Some(idx) } else { None };
             return true;
         }
+        self.state.focused_edit = None;
         false
     }
 
     pub fn mouse_up(&mut self, x: i32, y: i32, fonts: &mut Fonts) -> Option<UiEvent> {
+        if self.state.pressed_sys_min {
+            self.state.pressed_sys_min = false;
+            let (ww, _) = self.window_size();
+            let (mx, my, mw, mh) = sys_button_rect(BORDER + ww - 2 * BORDER - 13 - 17 - 2, BORDER + 2);
+            if x >= mx && x < mx + mw && y >= my && y < my + mh {
+                return Some(UiEvent::Minimize);
+            }
+            return None;
+        }
         if self.state.pressed_sys_close {
             self.state.pressed_sys_close = false;
             let (ww, _) = self.window_size();
@@ -712,6 +777,18 @@ impl Frame {
             ControlKind::Edit => {
                 surf.rect(x, y, w, h, WHITE);
                 sunken_field(surf, x, y, w, h);
+                // The edit shows its text (ES_AUTOHSCROLL: the tail scrolls
+                // into view) and a caret while focused, like Win95.
+                let text = self.text(c).to_string();
+                let mut shown = text.as_str();
+                while !shown.is_empty() && fonts.regular.text_width(shown) > w - 5 {
+                    shown = &shown[shown.char_indices().nth(1).map(|(i, _)| i).unwrap_or(shown.len())..];
+                }
+                fonts.regular.draw_text(surf, shown, x + 2, y + 1, BLACK);
+                if self.state.focused_edit == Some(idx) {
+                    let tx = x + 2 + fonts.regular.text_width(shown);
+                    surf.rect(tx, y + 2, 1, (h - 4).max(1), BLACK);
+                }
             }
             ControlKind::BorShade => match c.style & 0xF {
                 1 => shade_box(surf, x, y, w, h),
@@ -880,6 +957,7 @@ fn is_clickable(c: &Control) -> bool {
             | ControlKind::BorBtn
             | ControlKind::BorRadio
             | ControlKind::BorCheck
+            | ControlKind::Edit
             | ControlKind::BmpView
     )
 }

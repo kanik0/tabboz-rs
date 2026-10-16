@@ -367,3 +367,24 @@ fn famiglia_ok_button_renders_the_bwcc_bitmap_face() {
     }
     assert_eq!(mismatch, 0, "OK face not rendered (or offset wrong)");
 }
+
+#[test]
+fn personal_info_edits_accept_keyboard_input() {
+    // Dialog 11 (Personal Information): clicking an edit focuses it,
+    // typed characters land in its text, backspace removes them, and
+    // edit_texts() collects every field for the game (GetDlgItemText).
+    let mut frame = Frame::new(11);
+    let mut fonts = Fonts::new(1);
+    // Edit 102 (Nome): (64, 15) 72x9 DLU -> px (130, 50).
+    let (x, y) = (2 + 64 * 2 + 4, 20 + 15 * 2 + 2);
+    frame.mouse_down(x, y, &mut fonts);
+    assert!(frame.has_edit_focus());
+    for c in "Pierg".chars() {
+        frame.type_char(c);
+    }
+    assert!(frame.text(frame.dlg().controls.iter().find(|c| c.id == 102).unwrap()).starts_with("Pierg"));
+    frame.backspace();
+    assert!(frame.text(frame.dlg().controls.iter().find(|c| c.id == 102).unwrap()).starts_with("Pier"));
+    let edits = frame.edit_texts();
+    assert!(edits.contains(&(102, "Pier".to_string())));
+}
