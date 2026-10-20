@@ -14,6 +14,7 @@ name = "tabboz"
 path = "src/main.rs"
 
 [dependencies]
+dirs = "6"
 raw-window-handle = "0.6"
 rodio = "0.19"
 serde = { version = "1.0.229", features = ["derive"] }

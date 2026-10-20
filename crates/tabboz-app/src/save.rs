@@ -1,7 +1,10 @@
-// Save/load: JSON snapshot of the game state in
-// ~/Library/Application Support/tabboz/tabboz.json
+// Save/load: JSON snapshot of the game state in the per-user config dir:
+//   macOS:   ~/Library/Application Support/tabboz/tabboz.json
+//   Linux:   ~/.config/tabboz/tabboz.json
+//   Windows: %APPDATA%\tabboz\tabboz.json
 // (the original used the Windows registry / a save file; a single JSON
-// slot is the macOS equivalent, with the same field names as SalvaTutto).
+// slot is the cross-platform equivalent, with the same field names as
+// SalvaTutto).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,17 +15,11 @@ use tabboz_core::state::{GameState, Scooter};
 use tabboz_core::Rng;
 
 fn save_path() -> Option<PathBuf> {
-    dirs_or_home().map(|d| d.join("tabboz.json"))
-}
-
-fn dirs_or_home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let base = PathBuf::from(home).join("Library/Application Support/tabboz");
-        std::fs::create_dir_all(&base).ok()?;
-        Some(base)
-    } else {
-        None
-    }
+    // dirs::config_dir() returns the right per-user config directory on
+    // every platform (macOS Application Support, Linux XDG, Windows Roaming).
+    let base = dirs::config_dir()?.join("tabboz");
+    std::fs::create_dir_all(&base).ok()?;
+    Some(base.join("tabboz.json"))
 }
 
 #[derive(Serialize, Deserialize, Debug)]
