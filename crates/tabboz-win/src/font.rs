@@ -11,6 +11,7 @@
 
 use ab_glyph::{Font, FontArc, Glyph, PxScale, PxScaleFont, ScaleFont, point};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::pixel::{Pixel, Surface};
 
@@ -39,7 +40,9 @@ pub struct Face {
 
 struct CachedGlyph {
     /// Alpha coverage after the contrast curve, w*h (physical pixels).
-    bitmap: Vec<u8>,
+    /// Rc so draw_line/draw_accel_text can share it without deep-cloning
+    /// the bitmap for every character rendered.
+    bitmap: Rc<[u8]>,
     w: i32,
     h: i32,
     /// Offset of the bitmap top-left from the glyph origin (physical ints).
@@ -110,7 +113,7 @@ impl Face {
                     }
                 });
                 CachedGlyph {
-                    bitmap,
+                    bitmap: Rc::from(bitmap),
                     w,
                     h,
                     x: bb.min.x.round() as i32,
@@ -118,7 +121,7 @@ impl Face {
                     advance,
                 }
             } else {
-                CachedGlyph { bitmap: Vec::new(), w: 0, h: 0, x: 0, y: 0, advance }
+                CachedGlyph { bitmap: Rc::from(Vec::new()), w: 0, h: 0, x: 0, y: 0, advance }
             }
         })
     }
@@ -133,10 +136,11 @@ impl Face {
     }
 
     /// Draws one glyph's ink with alpha blending (physical coordinates).
-    fn stamp(&self, surf: &mut Surface, g: &CachedGlyph, gx: i32, gy: i32, color: Pixel) {
-        for yy in 0..g.h {
-            for xx in 0..g.w {
-                let a = g.bitmap[(yy * g.w + xx) as usize];
+    #[allow(clippy::too_many_arguments)] // internal helper, all args needed
+    fn stamp(&self, surf: &mut Surface, bitmap: &[u8], w: i32, h: i32, gx: i32, gy: i32, color: Pixel) {
+        for yy in 0..h {
+            for xx in 0..w {
+                let a = bitmap[(yy * w + xx) as usize];
                 if a > 0 {
                     surf.blend_phys(gx + xx, gy + yy, color, a);
                 }
@@ -150,13 +154,12 @@ impl Face {
         let baseline = y * scale + self.ascent.round() as i32;
         let mut pen = x * scale;
         for c in s.chars() {
-            // Copy what stamp needs so self is free again.
+            // Rc::clone is a refcount bump, not a deep copy of the bitmap.
             let (bitmap, w, h, gx, gy, advance) = {
                 let g = self.glyph(c);
-                (g.bitmap.clone(), g.w, g.h, pen + g.x, baseline + g.y, g.advance)
+                (Rc::clone(&g.bitmap), g.w, g.h, pen + g.x, baseline + g.y, g.advance)
             };
-            let g = CachedGlyph { bitmap, w, h, x: 0, y: 0, advance };
-            self.stamp(surf, &g, gx, gy, color);
+            self.stamp(surf, &bitmap, w, h, gx, gy, color);
             // Snap the pen to the physical grid: no subpixel drift.
             pen = (pen as f32 + advance).round() as i32;
         }
@@ -182,12 +185,12 @@ impl Face {
                     continue;
                 }
             }
+            // Rc::clone is a refcount bump, not a deep copy of the bitmap.
             let (bitmap, w, h, gx, gy, advance) = {
                 let g = self.glyph(c);
-                (g.bitmap.clone(), g.w, g.h, pen + g.x, baseline + g.y, g.advance)
+                (Rc::clone(&g.bitmap), g.w, g.h, pen + g.x, baseline + g.y, g.advance)
             };
-            let g = CachedGlyph { bitmap, w, h, x: 0, y: 0, advance };
-            self.stamp(surf, &g, gx, gy, color);
+            self.stamp(surf, &bitmap, w, h, gx, gy, color);
             if underline_next {
                 let uw = advance.round() as i32;
                 surf.rect((pen / scale).max(0), baseline / scale, (uw / scale).max(1), 1, color);

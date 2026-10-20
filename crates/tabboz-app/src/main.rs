@@ -63,6 +63,9 @@ struct App {
     game_tx: Option<Sender<GameAction>>,
     sound_tx: Option<Sender<u16>>,
     proxy: Option<EventLoopProxy<UiRequest>>,
+    /// Scratch buffer for rendering, reused across frames to avoid a
+    /// per-frame allocation of the whole physical pixel buffer.
+    render_buf: Vec<u32>,
 }
 
 struct MainWin {
@@ -84,32 +87,37 @@ impl App {
             game_tx: None,
             sound_tx: None,
             proxy: Some(proxy),
+            render_buf: Vec::new(),
         }
     }
 
     // ---- window helpers --------------------------------------------------
 
+    /// Renders a frame into the softbuffer surface, reusing `buf` as the
+    /// physical-pixel scratch buffer (resized as needed, never reallocated
+    /// per frame after the first call).
     fn render_win(
-        window: &Window,
         surface: &mut softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Arc<Window>>,
         frame: &mut Frame,
         fonts: &mut Fonts,
         scale: i32,
+        buf: &mut Vec<u32>,
     ) {
         let (lw, lh) = frame.window_size();
         let (pw, ph) = (lw * scale, lh * scale);
-        let mut physical = vec![0u32; (pw * ph) as usize];
+        let needed = (pw * ph) as usize;
+        buf.clear();
+        buf.resize(needed, 0);
         {
-            let mut s = Surface::new(&mut physical, lw, lh, scale);
+            let mut s = Surface::new(buf, lw, lh, scale);
             frame.render(&mut s, fonts);
         }
         if let (Some(pw_nz), Some(ph_nz)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) {
             surface.resize(pw_nz, ph_nz).expect("resize softbuffer surface");
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer");
-            buffer.copy_from_slice(&physical);
+            buffer.copy_from_slice(buf);
             buffer.present().expect("present");
         }
-        let _ = window;
     }
 
     /// Creates a dialog window: its own OS window sized to the dialog,
@@ -204,12 +212,18 @@ impl App {
 
     fn redraw_dialog(&mut self, id: WindowId) {
         let Some(ctx) = self.dialogs.get_mut(&id) else { return };
-        Self::render_win(&ctx.window.clone(), &mut ctx.surface, &mut ctx.frame, &mut ctx.fonts, ctx.scale);
+        // Take the scratch buffer out temporarily: ctx borrows self.dialogs
+        // mutably, so we cannot borrow self.render_buf at the same time.
+        let mut buf = std::mem::take(&mut self.render_buf);
+        Self::render_win(&mut ctx.surface, &mut ctx.frame, &mut ctx.fonts, ctx.scale, &mut buf);
+        self.render_buf = buf;
     }
 
     fn redraw_main(&mut self) {
         let Some(m) = &mut self.main else { return };
-        Self::render_win(&m.window.clone(), &mut m.surface, &mut m.frame, &mut m.fonts, m.scale);
+        let mut buf = std::mem::take(&mut self.render_buf);
+        Self::render_win(&mut m.surface, &mut m.frame, &mut m.fonts, m.scale, &mut buf);
+        self.render_buf = buf;
     }
 
     /// Closes a dialog window (by winit id): dropping the context destroys

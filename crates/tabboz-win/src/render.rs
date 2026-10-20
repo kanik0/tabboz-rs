@@ -90,12 +90,12 @@ fn blit_yellow_transparent(dst: &mut Image, src: &Image, x: i32, y: i32) {
 }
 
 fn asset_bitmap(name: &str) -> Option<Image> {
-    let a = crate::assets::BITMAPS.iter().find(|a| a.name == name)?;
+    let a = crate::assets::find_bitmaps(name)?;
     img::decode_bmp(a.data).ok()
 }
 
 fn asset_icon(name: &str) -> Option<Image> {
-    let a = crate::assets::ICONS.iter().find(|a| a.name == name)?;
+    let a = crate::assets::find_icons(name)?;
     img::decode_ico(a.data).ok()
 }
 
@@ -628,7 +628,7 @@ impl Frame {
     /// Chrome bitmap (novantotto/: OK/Cancel faces, glyphs) by name.
     fn cached_chrome(&mut self, name: &str) -> Option<Image> {
         if !self.state.cache.contains_key(name) {
-            let a = crate::assets::CHROME_BITMAPS.iter().find(|a| a.name == name)?;
+            let a = crate::assets::find_chrome_bitmaps(name)?;
             let img = img::decode_bmp(a.data).ok()?;
             self.state.cache.insert(name.to_string(), img);
         }

@@ -377,9 +377,12 @@ fn gen_strings(strings_dir: &Path, out: &mut String) -> usize {
     }
     w!("];");
     w!("");
-    w!("/// Looks up a string table entry by id.");
+    w!("/// Looks up a string table entry by id (binary search, STRINGS is sorted).");
     w!("pub fn find(id: u16) -> Option<&'static str> {");
-    w!("    STRINGS.iter().find(|s| s.id == id).map(|s| s.text)");
+    w!("    STRINGS");
+    w!("        .binary_search_by_key(&id, |s| s.id)");
+    w!("        .ok()");
+    w!("        .map(|i| STRINGS[i].text)");
     w!("}");
     entries.len()
 }

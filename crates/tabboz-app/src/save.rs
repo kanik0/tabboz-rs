@@ -180,7 +180,9 @@ pub fn save(state: &GameState) {
         euro: state.euro,
         sound_active: state.sound_active,
     };
-    if let Ok(json) = serde_json::to_string_pretty(&s) {
+    // Compact JSON: the save file is machine-read, pretty-printing only
+    // bloats it and slows down serialization.
+    if let Ok(json) = serde_json::to_string(&s) {
         if let Ok(mut f) = std::fs::File::create(&path) {
             let _ = f.write_all(json.as_bytes());
         }
