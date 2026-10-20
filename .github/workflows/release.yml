@@ -109,6 +109,5 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Tabboz Simulator ${{ steps.tag.outputs.date }}"
-          files: |
-            dist/*
+          files: dist/*
           generate_release_notes: true
